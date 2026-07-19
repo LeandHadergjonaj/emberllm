@@ -21,6 +21,7 @@ typedef struct {
     int         port;          /* listen port (default 8080)                   */
     int         threads;       /* decode threads; -1 = autotune                */
     int         ctx;           /* context cap (0 = model max)                  */
+    int         kv_fp16;       /* 1 = fp16 KV cache                            */
     int         think;         /* 1 = allow <think> reasoning (Qwen-style)     */
     int         max_tokens;    /* default reply cap when the request omits it  */
     float       temperature;   /* sampling defaults when the request omits them */

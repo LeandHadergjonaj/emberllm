@@ -7,10 +7,40 @@
 #define EMBER_KERNELS_H
 
 #include "ember.h"
+#include <string.h>
+
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
+#if defined(__F16C__) || defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 /* --- half precision (scalar, portable bit-twiddling) --------------------- */
 uint16_t ember_f32_to_f16(float f);
 float    ember_f16_to_f32(uint16_t h);
+
+/* Hot-loop fp16<->fp32 using one hardware instruction where available (NEON
+ * __fp16, x86 F16C), falling back to the portable bit-twiddling. Used by the
+ * matmul and the optional fp16 KV cache. */
+static inline float ember_f16f(uint16_t h) {
+#if defined(__ARM_NEON)
+    __fp16 v; memcpy(&v, &h, 2); return (float)v;
+#elif defined(__F16C__)
+    return _cvtsh_ss(h);
+#else
+    return ember_f16_to_f32(h);
+#endif
+}
+static inline uint16_t ember_f16c(float f) {
+#if defined(__ARM_NEON)
+    __fp16 v = (__fp16)f; uint16_t h; memcpy(&h, &v, 2); return h;
+#elif defined(__F16C__)
+    return (uint16_t)_cvtss_sh(f, 0);
+#else
+    return ember_f32_to_f16(f);
+#endif
+}
 
 /* --- Q8_0: 32-weight blocks, one fp16 scale + 32 int8 -------------------- */
 #pragma pack(push, 1)

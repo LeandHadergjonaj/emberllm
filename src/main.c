@@ -114,6 +114,9 @@ static int autotune_threads(EmberModel *m, EmberState *s) {
 /* Parse a --threads value that may be the literal "auto" (sentinel -1). */
 static int parse_threads(const char *v) { return strcmp(v, "auto") == 0 ? -1 : atoi(v); }
 
+/* Parse a --kv-type value: "f16" -> fp16 cache, anything else -> fp32. */
+static int parse_kv_type(const char *v) { return strcmp(v, "f16") == 0; }
+
 static int has_help(int argc, char **argv) {
     for (int i = 0; i < argc; i++)
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) return 1;
@@ -134,17 +137,19 @@ static const char GENERATE_HELP[] =
     "  --frequency-penalty F subtract F per occurrence in the window\n"
     "  --seed S             RNG seed for reproducible sampling\n"
     "  --ctx C              cap the context length\n"
+    "  --kv-type f32|f16    KV cache precision (f16 halves its memory; default f32)\n"
     "  --threads T|auto     decode threads (default 1)\n";
 
 static int cmd_generate(int argc, char **argv) {
     if (argc < 1 || has_help(argc, argv)) { fputs(GENERATE_HELP, stdout); return argc < 1; }
     const char *path = argv[0], *prompt = "";
-    int max_new = 256, ctx = 0, threads = 1, top_k = -1, repeat_last_n = 64;
+    int max_new = 256, ctx = 0, threads = 1, top_k = -1, repeat_last_n = 64, kv_fp16 = 0;
     float temp = -1.0f, top_p = -1.0f, min_p = 0.0f;
     float repeat_penalty = 1.0f, presence_penalty = 0.0f, frequency_penalty = 0.0f;
     uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
+        if      (!strcmp(argv[i], "--kv-type") && i + 1 < argc) kv_fp16 = parse_kv_type(argv[++i]);
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
@@ -169,7 +174,7 @@ static int cmd_generate(int argc, char **argv) {
     if (seed == 0) seed = 0xC0FFEEULL;
 
     EmberTokenizer *tok = ember_tokenizer_new(m);
-    EmberState *st = ember_state_new(m, ctx);
+    EmberState *st = ember_state_new_ex(m, ctx, kv_fp16);
     if (threads < 0) threads = autotune_threads(m, st); /* --threads auto */
     else ember_threads_init(threads);
     EmberSampler smp;
@@ -224,19 +229,20 @@ static double stddev(const double *v, int n, double mean) {
 
 static int cmd_bench(int argc, char **argv) {
     const char *path = argv[0];
-    int pp = 128, tg = 128, threads = 1, reps = 5, warmup = 1;
+    int pp = 128, tg = 128, threads = 1, reps = 5, warmup = 1, kv_fp16 = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--pp") && i + 1 < argc) pp = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tg") && i + 1 < argc) tg = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc) kv_fp16 = parse_kv_type(argv[++i]);
     }
 
     EmberModel *m = ember_model_load(path);
     if (!m) return 1;
     const EmberHeader *h = ember_model_header(m);
     ember_threads_init(threads);
-    EmberState *st = ember_state_new(m, pp + tg + 2);
+    EmberState *st = ember_state_new_ex(m, pp + tg + 2, kv_fp16);
 
     int ctx = h->max_seq_len;
     if (pp + tg + 1 > ctx) { pp = ctx / 2; tg = ctx / 2 - 1; }
@@ -314,18 +320,20 @@ static const char CHAT_HELP[] =
     "  --frequency-penalty F subtract F per occurrence in the window\n"
     "  --seed S             RNG seed\n"
     "  --ctx C              context length (default 4096)\n"
+    "  --kv-type f32|f16    KV cache precision (f16 halves its memory; default f32)\n"
     "  --threads T|auto     decode threads (default 1)\n";
 
 static int cmd_chat(int argc, char **argv) {
     if (argc < 1 || has_help(argc, argv)) { fputs(CHAT_HELP, stdout); return argc < 1; }
     const char *path = argv[0], *system = NULL;
-    int threads = 1, ctx = 4096, max_new = 512, think = 0, top_k = -1, repeat_last_n = 256;
+    int threads = 1, ctx = 4096, max_new = 512, think = 0, top_k = -1, repeat_last_n = 256, kv_fp16 = 0;
     float temp = -1.0f, top_p = -1.0f, min_p = 0.0f;
     /* small chat models loop badly without a repeat penalty, so chat defaults it on */
     float repeat_penalty = 1.1f, presence_penalty = 0.0f, frequency_penalty = 0.0f;
     uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_threads(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc) kv_fp16 = parse_kv_type(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) system = argv[++i];
@@ -352,7 +360,7 @@ static int cmd_chat(int argc, char **argv) {
     if (ctx > h->max_seq_len) ctx = h->max_seq_len;
 
     EmberTokenizer *tok = ember_tokenizer_new(m);
-    EmberState *st = ember_state_new(m, ctx);
+    EmberState *st = ember_state_new_ex(m, ctx, kv_fp16);
     if (threads < 0) threads = autotune_threads(m, st); /* --threads auto */
     else ember_threads_init(threads);
     EmberSampler smp;
@@ -413,10 +421,11 @@ static int cmd_chat(int argc, char **argv) {
 static int cmd_perplexity(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: ember perplexity <model> <textfile> [--threads T] [--max N]\n"); return 1; }
     const char *path = argv[0], *file = argv[1];
-    int threads = 1, maxtok = 2048;
+    int threads = 1, maxtok = 2048, kv_fp16 = 0;
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max") && i + 1 < argc) maxtok = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc) kv_fp16 = parse_kv_type(argv[++i]);
     }
 
     FILE *f = fopen(file, "rb");
@@ -432,7 +441,7 @@ static int cmd_perplexity(int argc, char **argv) {
     ember_threads_init(threads);
     EmberTokenizer *tok = ember_tokenizer_new(m);
     int ctx = maxtok + 2 < h->max_seq_len ? maxtok + 2 : h->max_seq_len;
-    EmberState *st = ember_state_new(m, ctx);
+    EmberState *st = ember_state_new_ex(m, ctx, kv_fp16);
 
     int *ids, n = ember_encode(tok, text, 0, &ids);
     if (n > maxtok) n = maxtok;
@@ -467,6 +476,7 @@ static const char SERVE_HELP[] =
     "  --host H             bind address (default 127.0.0.1)\n"
     "  --port P             listen port (default 8080)\n"
     "  --ctx C              context length (default: model max)\n"
+    "  --kv-type f32|f16    KV cache precision (f16 halves its memory; default f32)\n"
     "  --threads T|auto     decode threads (default 1)\n"
     "  --think              allow <think> reasoning in replies (Qwen-style)\n"
     "  -n N                 default max_tokens when a request omits it (default 512)\n"
@@ -482,7 +492,7 @@ static const char SERVE_HELP[] =
 static int cmd_serve(int argc, char **argv) {
     if (argc < 1 || has_help(argc, argv)) { fputs(SERVE_HELP, stdout); return argc < 1; }
     ServeConfig cfg = {
-        .host = "127.0.0.1", .port = 8080, .threads = 1, .ctx = 0, .think = 0,
+        .host = "127.0.0.1", .port = 8080, .threads = 1, .ctx = 0, .kv_fp16 = 0, .think = 0,
         .max_tokens = 512, .temperature = -1.0f, .top_p = -1.0f, .top_k = -1,
         .repeat_penalty = 1.1f, .seed = 0xC0FFEEULL,
     };
@@ -490,6 +500,7 @@ static int cmd_serve(int argc, char **argv) {
         if      (!strcmp(argv[i], "--host") && i + 1 < argc) cfg.host = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) cfg.port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) cfg.ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--kv-type") && i + 1 < argc) cfg.kv_fp16 = parse_kv_type(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = parse_threads(argv[++i]);
         else if (!strcmp(argv[i], "--think")) cfg.think = 1;
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) cfg.max_tokens = atoi(argv[++i]);

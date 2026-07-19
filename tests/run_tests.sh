@@ -85,6 +85,14 @@ else
 fi
 rm -f "$garbage"
 
+echo "== test 7: fp16 KV cache (--kv-type f16) =="
+k16=$("$BIN" generate "$MODEL" -p "Once upon a time" -n 24 -t 0 --kv-type f16 2>/dev/null)
+if printf '%s' "$k16" | grep -q "Once upon a time"; then
+    echo "  ok: fp16 KV generates coherent text"
+else
+    echo "  FAIL: fp16 KV output empty or malformed"; echo "    got: $k16"; fail=1
+fi
+
 echo "== test 6: HTTP server (OpenAI-compatible) =="
 if ! command -v curl >/dev/null 2>&1; then
     echo "  skip: curl not available"

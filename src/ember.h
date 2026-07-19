@@ -117,7 +117,10 @@ const EmberTensor *ember_model_tensor(const EmberModel *m, const char *name);
 const void        *ember_model_data(const EmberModel *m, const EmberTensor *t);
 
 /* model.c */
-EmberState *ember_state_new(const EmberModel *m, int ctx_len);
+EmberState *ember_state_new(const EmberModel *m, int ctx_len); /* fp32 KV cache */
+/* As above, but `kv_fp16` != 0 stores the KV cache in half precision (halves its
+ * memory and the bytes attention streams at long context, for a tiny accuracy cost). */
+EmberState *ember_state_new_ex(const EmberModel *m, int ctx_len, int kv_fp16);
 void        ember_state_free(EmberState *s);
 /* Run one forward pass for token `tok` at position `pos`; returns logits
  * (length vocab_size), owned by the state. */

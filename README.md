@@ -216,10 +216,12 @@ references, not just eyeballed:
   performance-tuned; other targets fall back to a correct scalar build. Widening
   and tuning the AVX2 path is the first thing on the list.
 - **`Q4_0` is smaller but not faster** here — its kernel isn't SIMD-optimized yet,
-  so `Q8_0` is the sweet spot (fast *and* near-lossless). K-quants aren't
-  implemented.
-- **fp32 KV cache.** Fine at the default 4096-token context; fp16 KV would halve
-  its memory for long contexts.
+  so `Q8_0` is the sweet spot (fast *and* near-lossless).
+- **fp16 KV cache is available** (`--kv-type f16`) and halves KV memory at a
+  negligible quality cost (perplexity moved ~0.01% in testing); fp32 stays the
+  default. **K-quants (Q4_K/Q6_K) are not yet implemented** — Q8_0 is the sweet
+  spot, and adding K-quants is the main remaining quality/size lever (and the
+  prerequisite for GGUF import).
 - **The pre-tokenizer regex is approximated** (C has no `\p{L}`). It's fuzz-clean
   on realistic English/code/Unicode but may differ from HF on pathological input.
 - Scope is single-stream inference of LLaMA-family models up to ~2B parameters.

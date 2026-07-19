@@ -462,7 +462,7 @@ int ember_serve(const char *model_path, const ServeConfig *cfg) {
     if (!sv.m) return 1;
     sv.h = ember_model_header(sv.m);
     sv.tok = ember_tokenizer_new(sv.m);
-    sv.st = ember_state_new(sv.m, cfg->ctx);
+    sv.st = ember_state_new_ex(sv.m, cfg->ctx, cfg->kv_fp16);
     sv.ctx = cfg->ctx > 0 && cfg->ctx < sv.h->max_seq_len ? cfg->ctx : sv.h->max_seq_len;
 
     /* model name = basename of the path, without extension */

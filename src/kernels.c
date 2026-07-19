@@ -147,20 +147,6 @@ static float dot_f32(const float *a, const float *b, int n) {
 #endif
 }
 
-/* Fast half->float for the hot loop: one hardware instruction on ARM, the
- * portable bit-twiddling elsewhere. */
-static inline float f16_fast(uint16_t h) {
-#if defined(__ARM_NEON)
-    __fp16 v;
-    memcpy(&v, &h, 2);
-    return (float)v;
-#elif defined(__F16C__)
-    return _cvtsh_ss(h);
-#else
-    return ember_f16_to_f32(h);
-#endif
-}
-
 /* dot of a Q8_0 weight row with a Q8_0 activation row (nb blocks). */
 static float vecdot_q8(const BlockQ8_0 *w, const BlockQ8_0 *x, int nb) {
     float sum = 0.0f;
@@ -174,7 +160,7 @@ static float vecdot_q8(const BlockQ8_0 *w, const BlockQ8_0 *x, int nb) {
 #else
         for (int i = 0; i < EMBER_Q_BLOCK; i++) acc += (int)w[b].qs[i] * (int)x[b].qs[i];
 #endif
-        sum += (float)acc * f16_fast(w[b].d) * f16_fast(x[b].d);
+        sum += (float)acc * ember_f16f(w[b].d) * ember_f16f(x[b].d);
     }
     return sum;
 }
@@ -191,7 +177,7 @@ static float vecdot_q4(const BlockQ4_0 *w, const BlockQ8_0 *x, int nb) {
             int w1 = (int)(q[i] >> 4) - 8;
             acc += w0 * (int)a[i] + w1 * (int)a[i + EMBER_Q_BLOCK / 2];
         }
-        sum += (float)acc * f16_fast(w[b].d) * f16_fast(x[b].d);
+        sum += (float)acc * ember_f16f(w[b].d) * ember_f16f(x[b].d);
     }
     return sum;
 }
