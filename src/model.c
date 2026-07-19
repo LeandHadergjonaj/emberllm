@@ -6,6 +6,7 @@
  */
 #include "ember.h"
 #include "kernels.h"
+#include "util.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -73,6 +74,7 @@ static void dequant_q8_row(const BlockQ8_0 *row, int n, float *out) {
 }
 
 static void embed_row(const Wt *w, int tok, int dim, float *out) {
+    if (!w->data) ember_die("model is missing its token-embedding tensor");
     if (w->dtype == EMBER_DT_F32) {
         memcpy(out, (const float *)w->data + (size_t)tok * dim, sizeof(float) * dim);
     } else { /* Q8_0 embedding table */
@@ -107,12 +109,14 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->ctx = (ctx_len > 0 && ctx_len < h->max_seq_len) ? ctx_len : h->max_seq_len;
 
     int L = s->n_layers;
-    s->wq = malloc(sizeof(Wt) * L); s->wk = malloc(sizeof(Wt) * L);
-    s->wv = malloc(sizeof(Wt) * L); s->wo = malloc(sizeof(Wt) * L);
-    s->w1 = malloc(sizeof(Wt) * L); s->w2 = malloc(sizeof(Wt) * L);
-    s->w3 = malloc(sizeof(Wt) * L);
-    s->attn_norm = malloc(sizeof(void *) * L); s->ffn_norm = malloc(sizeof(void *) * L);
-    s->q_norm = malloc(sizeof(void *) * L); s->k_norm = malloc(sizeof(void *) * L);
+    s->wq = ember_xmalloc(sizeof(Wt) * L, "wq"); s->wk = ember_xmalloc(sizeof(Wt) * L, "wk");
+    s->wv = ember_xmalloc(sizeof(Wt) * L, "wv"); s->wo = ember_xmalloc(sizeof(Wt) * L, "wo");
+    s->w1 = ember_xmalloc(sizeof(Wt) * L, "w1"); s->w2 = ember_xmalloc(sizeof(Wt) * L, "w2");
+    s->w3 = ember_xmalloc(sizeof(Wt) * L, "w3");
+    s->attn_norm = ember_xmalloc(sizeof(void *) * L, "attn_norm");
+    s->ffn_norm = ember_xmalloc(sizeof(void *) * L, "ffn_norm");
+    s->q_norm = ember_xmalloc(sizeof(void *) * L, "q_norm");
+    s->k_norm = ember_xmalloc(sizeof(void *) * L, "k_norm");
     for (int l = 0; l < L; l++) {
         s->wq[l] = tref(m, "layers.%d.wq", l); s->wk[l] = tref(m, "layers.%d.wk", l);
         s->wv[l] = tref(m, "layers.%d.wv", l); s->wo[l] = tref(m, "layers.%d.wo", l);
@@ -127,21 +131,33 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->final_norm = tref_f32(m, "final_norm", -1);
     s->lm_head = (h->flags & EMBER_FLAG_TIED_EMBED) ? s->tok_emb : tref(m, "lm_head", -1);
 
+    /* Fail loudly (not with a NULL deref mid-forward) if the file is missing a
+     * tensor the forward pass will dereference. */
+    if (!s->tok_emb.data)   ember_die("model is missing tensor 'tok_embeddings'");
+    if (!s->final_norm)     ember_die("model is missing tensor 'final_norm'");
+    if (!s->lm_head.data)   ember_die("model is missing tensor 'lm_head' (and is not tied)");
+    for (int l = 0; l < L; l++) {
+        if (!s->wq[l].data || !s->wk[l].data || !s->wv[l].data || !s->wo[l].data ||
+            !s->w1[l].data || !s->w2[l].data || !s->w3[l].data ||
+            !s->attn_norm[l] || !s->ffn_norm[l])
+            ember_die("model is missing a required tensor in layer %d", l);
+    }
+
     int hd = s->head_dim, nh = s->n_heads;
     int qd = nh * hd; /* query width; with decoupled head_dim this can exceed dim */
     int wide = s->hidden > s->dim ? s->hidden : s->dim;
     if (qd > wide) wide = qd;
-    s->x = malloc(sizeof(float) * s->dim);
-    s->xb = malloc(sizeof(float) * (qd > s->dim ? qd : s->dim)); /* holds attn output (qd) */
-    s->xb2 = malloc(sizeof(float) * s->dim);
-    s->hb = malloc(sizeof(float) * s->hidden);
-    s->hb2 = malloc(sizeof(float) * s->hidden);
-    s->q = malloc(sizeof(float) * nh * hd);
-    s->att = malloc(sizeof(float) * nh * s->ctx);
-    s->logits = malloc(sizeof(float) * s->vocab);
-    s->key_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
-    s->value_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
-    s->xq = malloc(sizeof(BlockQ8_0) * (wide / EMBER_Q_BLOCK + 1));
+    s->x = ember_xmalloc(sizeof(float) * s->dim, "activation x");
+    s->xb = ember_xmalloc(sizeof(float) * (qd > s->dim ? qd : s->dim), "activation xb");
+    s->xb2 = ember_xmalloc(sizeof(float) * s->dim, "activation xb2");
+    s->hb = ember_xmalloc(sizeof(float) * s->hidden, "activation hb");
+    s->hb2 = ember_xmalloc(sizeof(float) * s->hidden, "activation hb2");
+    s->q = ember_xmalloc(sizeof(float) * nh * hd, "activation q");
+    s->att = ember_xmalloc(sizeof(float) * nh * s->ctx, "attention scores");
+    s->logits = ember_xmalloc(sizeof(float) * s->vocab, "logits");
+    s->key_cache = ember_xmalloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim, "key cache");
+    s->value_cache = ember_xmalloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim, "value cache");
+    s->xq = ember_xmalloc(sizeof(BlockQ8_0) * (wide / EMBER_Q_BLOCK + 1), "activation quant scratch");
     return s;
 }
 
@@ -223,18 +239,22 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
     int wide = dim;
     if (hidden > wide) wide = hidden;
     if (qd > wide) wide = qd;
-    float *X   = malloc(sizeof(float) * (size_t)n * dim);
-    float *Xn  = malloc(sizeof(float) * (size_t)n * dim);
-    float *Tmp = malloc(sizeof(float) * (size_t)n * dim);
-    float *Q   = malloc(sizeof(float) * (size_t)n * qd);
-    float *Kb  = malloc(sizeof(float) * (size_t)n * kv_dim);
-    float *Vb  = malloc(sizeof(float) * (size_t)n * kv_dim);
-    float *Ob  = malloc(sizeof(float) * (size_t)n * qd);
-    float *H1  = malloc(sizeof(float) * (size_t)n * hidden);
-    float *H2  = malloc(sizeof(float) * (size_t)n * hidden);
-    BlockQ8_0 *xqb = malloc(sizeof(BlockQ8_0) * (size_t)n * (wide / EMBER_Q_BLOCK + 1));
+    float *X   = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill X");
+    float *Xn  = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill Xn");
+    float *Tmp = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill Tmp");
+    float *Q   = ember_xmalloc(sizeof(float) * (size_t)n * qd, "prefill Q");
+    float *Kb  = ember_xmalloc(sizeof(float) * (size_t)n * kv_dim, "prefill K");
+    float *Vb  = ember_xmalloc(sizeof(float) * (size_t)n * kv_dim, "prefill V");
+    float *Ob  = ember_xmalloc(sizeof(float) * (size_t)n * qd, "prefill O");
+    float *H1  = ember_xmalloc(sizeof(float) * (size_t)n * hidden, "prefill H1");
+    float *H2  = ember_xmalloc(sizeof(float) * (size_t)n * hidden, "prefill H2");
+    BlockQ8_0 *xqb = ember_xmalloc(sizeof(BlockQ8_0) * (size_t)n * (wide / EMBER_Q_BLOCK + 1), "prefill quant scratch");
 
-    for (int b = 0; b < n; b++) embed_row(&s->tok_emb, ids[b], dim, X + (size_t)b * dim);
+    for (int b = 0; b < n; b++) {
+        if (ids[b] < 0 || ids[b] >= s->vocab)
+            ember_die("token id %d out of range [0,%d)", ids[b], s->vocab);
+        embed_row(&s->tok_emb, ids[b], dim, X + (size_t)b * dim);
+    }
 
     for (int l = 0; l < s->n_layers; l++) {
         for (int b = 0; b < n; b++)
@@ -291,6 +311,10 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
     int kv_dim = s->kv_dim, kv_mul = nh / nkv;
     float eps = s->norm_eps;
 
+    if (tok < 0 || tok >= s->vocab)
+        ember_die("token id %d out of range [0,%d)", tok, s->vocab);
+    if (pos < 0 || pos >= s->ctx)
+        ember_die("position %d out of range [0,%d)", pos, s->ctx);
     embed_row(&s->tok_emb, tok, dim, s->x);
 
     for (int l = 0; l < s->n_layers; l++) {

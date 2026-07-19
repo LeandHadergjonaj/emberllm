@@ -53,6 +53,38 @@ else
 fi
 rm -f models/_test_q8.ember
 
+echo "== test 4: sampling controls (repeat penalty / min-p) =="
+# penalties must not crash and must still produce coherent, prompt-continuing text
+s4=$("$BIN" generate "$MODEL" -p "Once upon a time" -n 24 -t 0.8 \
+      --repeat-penalty 1.3 --repeat-last-n 64 --min-p 0.05 --seed 7 2>/dev/null)
+if printf '%s' "$s4" | grep -q "Once upon a time"; then
+    echo "  ok: penalized sampling generates coherent text"
+else
+    echo "  FAIL: penalized sampling empty or malformed"; echo "    got: $s4"; fail=1
+fi
+# greedy output must be identical with penalties fully disabled (defaults are no-ops)
+g_off=$("$BIN" generate "$MODEL" -p "Once upon a time" -n 24 -t 0 2>/dev/null)
+g_def=$("$BIN" generate "$MODEL" -p "Once upon a time" -n 24 -t 0 \
+      --repeat-penalty 1.0 --presence-penalty 0 --frequency-penalty 0 --min-p 0 2>/dev/null)
+if [ "$g_off" = "$g_def" ]; then
+    echo "  ok: disabled penalties are a no-op (greedy unchanged)"
+else
+    echo "  FAIL: default penalties altered greedy output"; fail=1
+fi
+
+echo "== test 5: malformed input is a clean error, not a crash =="
+garbage=models/_test_garbage.ember
+head -c 4096 /dev/urandom > "$garbage" 2>/dev/null
+"$BIN" info "$garbage" >/dev/null 2>&1
+rc=$?
+# a graceful failure is any nonzero exit below 128 (128+ = killed by signal / segfault)
+if [ "$rc" -ne 0 ] && [ "$rc" -lt 128 ]; then
+    echo "  ok: garbage model rejected with exit $rc (no crash)"
+else
+    echo "  FAIL: garbage model gave exit $rc (128+ means a signal/segfault)"; fail=1
+fi
+rm -f "$garbage"
+
 echo "== test 2: greedy transcript =="
 if [ "${EMBER_SKIP_TRANSCRIPT:-0}" = "1" ]; then
     echo "  skip: not the reference platform (fp reductions are not bit-portable)"

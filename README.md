@@ -1,6 +1,6 @@
 # emberllm
 
-A CPU-only LLM inference engine, written from scratch in ~2,000 lines of C11.
+A CPU-only LLM inference engine, written from scratch in ~2,300 lines of C11.
 No GPU, no runtime dependencies, one `Makefile`. It runs a 110M-parameter model
 at **~260 tokens/second** and holds a real chat with **Qwen3-0.6B at ~60 tok/s**
 on a plain laptop CPU.
@@ -42,6 +42,34 @@ make                              # builds ./ember (C11, uses NEON/AVX where pre
 
 No weights are committed; `download.sh` fetches them from Hugging Face and the
 converter turns them into a single self-describing `.ember` file.
+
+Every subcommand documents itself: `ember generate --help`, `ember chat --help`, etc.
+
+## Sampling and reproducibility
+
+`generate` and `chat` expose the standard sampling controls:
+
+```sh
+ember generate model.ember -p "..." \
+  -t 0.8 --top-k 40 --top-p 0.95 --min-p 0.05 \
+  --repeat-penalty 1.2 --repeat-last-n 256 \
+  --presence-penalty 0.1 --frequency-penalty 0.1 --seed 42
+```
+
+- **`--repeat-penalty`** (`>1` discourages), **`--presence-penalty`**, and
+  **`--frequency-penalty`** act over the last **`--repeat-last-n`** tokens — the
+  single biggest quality win for small chat models, which otherwise loop. `chat`
+  turns on a mild `--repeat-penalty 1.1` by default; `generate` leaves it off.
+- **`--min-p`** keeps only tokens with probability ≥ `min_p × peak`.
+- All penalty controls default to no-ops, so a plain temperature/top-k/top-p run
+  is unchanged.
+
+**Reproducibility:** a fixed `--seed` reproduces a run **bit-for-bit within one
+binary**. It is *not* portable across builds or machines — the forward pass sums
+floats in parallel and with `-ffast-math`, so reduction order (and thus the last
+ULP of each logit) depends on thread count, SIMD width, and compiler flags. For a
+byte-stable oracle use the `make debug` build single-threaded (`--threads 1`),
+which is what the golden-transcript test relies on.
 
 ## Measured performance
 
@@ -104,7 +132,8 @@ src/kernels.c     matmul + dot kernels (scalar / NEON / AVX2), Q8_0/Q4_0
 src/threads.c     fork-join thread pool
 src/tokenizer.c   SentencePiece-BPE and byte-level BPE, both from scratch
 src/quant.c       offline fp32 -> Q8_0/Q4_0
-src/sample.c      greedy / temperature / top-k / top-p
+src/sample.c      greedy / temperature / top-k / top-p / min-p + repeat penalties
+src/util.c        checked allocation + fatal-error helpers
 src/main.c        info | tokenize | generate | chat | bench | perplexity | quantize
 tools/convert.py  llama2.c and Qwen3-safetensors -> .ember (numpy only, no torch)
 ```
@@ -139,6 +168,9 @@ references, not just eyeballed:
   on realistic English/code/Unicode but may differ from HF on pathological input.
 - Scope is single-stream inference of models up to ~1B parameters. No training,
   batching across requests, speculative decoding, or GGUF import.
+- Malformed models and bad inputs fail with a clear `ember: ...` message rather
+  than a crash, but the loader trusts a well-formed header's internal offsets
+  once the top-level bounds check passes.
 
 ## Credits
 

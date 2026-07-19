@@ -112,10 +112,34 @@ static int autotune_threads(EmberModel *m, EmberState *s) {
 /* Parse a --threads value that may be the literal "auto" (sentinel -1). */
 static int parse_threads(const char *v) { return strcmp(v, "auto") == 0 ? -1 : atoi(v); }
 
+static int has_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++)
+        if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) return 1;
+    return 0;
+}
+
+static const char GENERATE_HELP[] =
+    "usage: ember generate <model.ember> [options]\n"
+    "  -p PROMPT            prompt text (default: empty -> BOS only)\n"
+    "  -n N                 max new tokens (default 256)\n"
+    "  -t TEMP              temperature; 0 = greedy (default: model's)\n"
+    "  --top-p P            nucleus sampling threshold\n"
+    "  --top-k K            keep only the K most likely tokens\n"
+    "  --min-p P            keep tokens with prob >= P * peak (0 = off)\n"
+    "  --repeat-penalty R   penalize repeats; >1 discourages (1.0 = off)\n"
+    "  --repeat-last-n N    penalty window in tokens (default 64)\n"
+    "  --presence-penalty P subtract P from any token seen in the window\n"
+    "  --frequency-penalty F subtract F per occurrence in the window\n"
+    "  --seed S             RNG seed for reproducible sampling\n"
+    "  --ctx C              cap the context length\n"
+    "  --threads T|auto     decode threads (default 1)\n";
+
 static int cmd_generate(int argc, char **argv) {
+    if (argc < 1 || has_help(argc, argv)) { fputs(GENERATE_HELP, stdout); return argc < 1; }
     const char *path = argv[0], *prompt = "";
-    int max_new = 256, ctx = 0, threads = 1, top_k = -1;
-    float temp = -1.0f, top_p = -1.0f;
+    int max_new = 256, ctx = 0, threads = 1, top_k = -1, repeat_last_n = 64;
+    float temp = -1.0f, top_p = -1.0f, min_p = 0.0f;
+    float repeat_penalty = 1.0f, presence_penalty = 0.0f, frequency_penalty = 0.0f;
     uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-p") && i + 1 < argc) prompt = argv[++i];
@@ -123,9 +147,15 @@ static int cmd_generate(int argc, char **argv) {
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) min_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat-penalty") && i + 1 < argc) repeat_penalty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat-last-n") && i + 1 < argc) repeat_last_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--presence-penalty") && i + 1 < argc) presence_penalty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--frequency-penalty") && i + 1 < argc) frequency_penalty = atof(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_threads(argv[++i]);
+        else { fprintf(stderr, "ember: unknown generate option '%s'\n", argv[i]); return 1; }
     }
 
     EmberModel *m = ember_model_load(path);
@@ -142,9 +172,12 @@ static int cmd_generate(int argc, char **argv) {
     else ember_threads_init(threads);
     EmberSampler smp;
     ember_sampler_init(&smp, temp, top_p, top_k, seed);
+    ember_sampler_set_penalties(&smp, repeat_penalty, repeat_last_n,
+                                presence_penalty, frequency_penalty, min_p);
 
     int *ids, n_prompt = ember_encode(tok, prompt, 1, &ids);
     if (n_prompt < 1) { ids = malloc(sizeof(int)); ids[0] = h->bos_token_id; n_prompt = 1; }
+    for (int i = 0; i < n_prompt; i++) ember_sampler_accept(&smp, ids[i]); /* seed penalty window */
 
     double t0 = now_sec();
     float *logits = ember_prefill(m, st, ids, n_prompt, 0);
@@ -172,6 +205,7 @@ static int cmd_generate(int argc, char **argv) {
             generated, generated / (t_decode + 1e-9), threads);
 
     free(ids);
+    ember_sampler_free(&smp);
     ember_state_free(st);
     ember_tokenizer_free(tok);
     ember_threads_shutdown();
@@ -263,10 +297,30 @@ static float *feed(EmberModel *m, EmberState *s, EmberTokenizer *tok,
     return logits;
 }
 
+static const char CHAT_HELP[] =
+    "usage: ember chat <model.ember> [options]\n"
+    "  --system S           system prompt\n"
+    "  --think              let the model emit <think> reasoning\n"
+    "  -n N                 max new tokens per reply (default 512)\n"
+    "  -t TEMP              temperature (default: model's)\n"
+    "  --top-p P            nucleus sampling threshold\n"
+    "  --top-k K            keep only the K most likely tokens\n"
+    "  --min-p P            keep tokens with prob >= P * peak\n"
+    "  --repeat-penalty R   penalize repeats (default 1.1; 1.0 = off)\n"
+    "  --repeat-last-n N    penalty window in tokens (default 256)\n"
+    "  --presence-penalty P subtract P from any token seen in the window\n"
+    "  --frequency-penalty F subtract F per occurrence in the window\n"
+    "  --seed S             RNG seed\n"
+    "  --ctx C              context length (default 4096)\n"
+    "  --threads T|auto     decode threads (default 1)\n";
+
 static int cmd_chat(int argc, char **argv) {
+    if (argc < 1 || has_help(argc, argv)) { fputs(CHAT_HELP, stdout); return argc < 1; }
     const char *path = argv[0], *system = NULL;
-    int threads = 1, ctx = 4096, max_new = 512, think = 0, top_k = -1;
-    float temp = -1.0f, top_p = -1.0f;
+    int threads = 1, ctx = 4096, max_new = 512, think = 0, top_k = -1, repeat_last_n = 256;
+    float temp = -1.0f, top_p = -1.0f, min_p = 0.0f;
+    /* small chat models loop badly without a repeat penalty, so chat defaults it on */
+    float repeat_penalty = 1.1f, presence_penalty = 0.0f, frequency_penalty = 0.0f;
     uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_threads(argv[++i]);
@@ -277,7 +331,13 @@ static int cmd_chat(int argc, char **argv) {
         else if (!strcmp(argv[i], "-t") && i + 1 < argc) temp = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) top_p = atof(argv[++i]);
         else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--min-p") && i + 1 < argc) min_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat-penalty") && i + 1 < argc) repeat_penalty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat-last-n") && i + 1 < argc) repeat_last_n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--presence-penalty") && i + 1 < argc) presence_penalty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--frequency-penalty") && i + 1 < argc) frequency_penalty = atof(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
+        else { fprintf(stderr, "ember: unknown chat option '%s'\n", argv[i]); return 1; }
     }
 
     EmberModel *m = ember_model_load(path);
@@ -295,6 +355,8 @@ static int cmd_chat(int argc, char **argv) {
     else ember_threads_init(threads);
     EmberSampler smp;
     ember_sampler_init(&smp, temp, top_p, top_k, seed);
+    ember_sampler_set_penalties(&smp, repeat_penalty, repeat_last_n,
+                                presence_penalty, frequency_penalty, min_p);
 
     int pos = 0;
     char buf[8192];
@@ -333,6 +395,7 @@ static int cmd_chat(int argc, char **argv) {
         if (pos >= ctx - 1) { fprintf(stderr, "[context full]\n"); break; }
     }
 
+    ember_sampler_free(&smp);
     ember_state_free(st);
     ember_tokenizer_free(tok);
     ember_threads_shutdown();
@@ -401,20 +464,25 @@ static int cmd_quantize(int argc, char **argv) {
     return ember_quantize_file(argv[0], argv[1], target);
 }
 
+static const char TOP_USAGE[] =
+    "emberllm — a from-scratch CPU LLM inference engine.\n"
+    "\n"
+    "usage: ember <command> [args]   (run 'ember <command> --help' for options)\n"
+    "\n"
+    "  info       <model.ember>                 print model metadata\n"
+    "  tokenize   <model.ember> \"text\"           encode text to token ids\n"
+    "  generate   <model.ember> [options]       one-shot text completion\n"
+    "  chat       <model.ember> [options]       interactive chat (ChatML)\n"
+    "  bench      <model.ember> [options]       prefill/decode throughput\n"
+    "  perplexity <model.ember> <textfile>      quality gate over a corpus\n"
+    "  quantize   <in.ember> <out.ember> [q8_0|q4_0]   requantize weights\n";
+
 int main(int argc, char **argv) {
-    if (argc < 3) {
-        fprintf(stderr,
-            "usage:\n"
-            "  ember info     <model.ember>\n"
-            "  ember tokenize <model.ember> \"text\"\n"
-            "  ember generate <model.ember> [-p PROMPT] [-n N] [-t TEMP]\n"
-            "                 [--top-p P] [--top-k K] [--seed S] [--ctx C] [--threads T|auto]\n"
-            "  ember chat     <model.ember> [--system S] [--think] [-n N] [-t TEMP]\n"
-            "                 [--ctx C] [--threads T|auto] [--top-p P] [--top-k K] [--seed S]\n"
-            "  ember bench    <model.ember> [--pp P] [--tg N] [--threads T] [--reps R]\n"
-            "  ember quantize <in.ember> <out.ember> [q8_0|q4_0]\n");
-        return 1;
+    if (argc >= 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help"))) {
+        fputs(TOP_USAGE, stdout);
+        return 0;
     }
+    if (argc < 3) { fputs(TOP_USAGE, stderr); return 1; }
     if (!strcmp(argv[1], "info"))     return cmd_info(argv[2]);
     if (!strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
     if (!strcmp(argv[1], "generate")) return cmd_generate(argc - 2, argv + 2);
