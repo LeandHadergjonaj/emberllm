@@ -6,7 +6,7 @@ at **~260 tokens/second** and holds a real chat with **Qwen3-0.6B at ~60 tok/s**
 on a plain laptop CPU.
 
 ```
-$ ./ember chat models/qwen3-0.6b-q8.ember --threads 6
+$ ./ember chat models/qwen3-0.6b-q8.ember --threads auto
 
 > Write a haiku about winter.
 A frost-kissed sky
@@ -37,7 +37,7 @@ make                              # builds ./ember (C11, uses NEON/AVX where pre
 
 # a real chat model — Qwen3-0.6B (needs: pip install numpy safetensors)
 ./tools/download.sh qwen3-0.6b
-./ember chat models/qwen3-0.6b-q8.ember --threads 6
+./ember chat models/qwen3-0.6b-q8.ember --threads auto
 ```
 
 No weights are committed; `download.sh` fetches them from Hugging Face and the
@@ -77,10 +77,12 @@ Everything in emberllm follows from that one fact:
   fp16 scale) cuts bytes-per-token ~4× versus fp32 and is near-lossless — its
   perplexity is within 0.3% of fp32 on this model. `Q4_0` halves it again for
   some quality cost. Quantization is done offline by `ember quantize`.
-- **Threads help until bandwidth saturates.** A hand-rolled pool splits each
-  matmul across cores. Big models (Qwen3) scale to ~6 threads; the tiny 110M
-  model is already bandwidth/overhead-bound at one thread and doesn't benefit —
-  which is exactly what the roofline predicts.
+- **Threads help until bandwidth saturates — so let the engine pick.** A hand-rolled
+  pool splits each matmul (and attention over heads) across cores, but the useful
+  thread count depends on the model: big models (Qwen3) scale to ~6 threads, while a
+  small quantized model is bandwidth-bound and fastest at 1. Rather than guess, pass
+  **`--threads auto`** and the engine measures a few token times and picks the best
+  count for *your* model and machine. See [report.md](report.md) for the analysis.
 - **SIMD keeps a core from going compute-bound.** NEON (`sdot`) on Apple Silicon,
   AVX2 on x86, with a scalar fallback. The single biggest kernel win was doing
   fp16→fp32 scale conversion in one hardware instruction instead of by hand.

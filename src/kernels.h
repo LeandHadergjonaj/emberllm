@@ -44,4 +44,12 @@ void ember_threads_shutdown(void);
 int  ember_nthreads(void);
 void ember_parallel_for(EmberRangeFn fn, void *ctx, int n);
 
+/* Minimum work (≈ multiply-accumulates) per thread to make splitting a loop
+ * worth the dispatch + barrier cost. Below this, running serially is faster. */
+#define EMBER_PAR_MIN_PER_THREAD 32768
+/* Should a loop of the given total work be parallelized at the current thread
+ * count? True only when each thread would get at least the floor above, so tiny
+ * memory-bound ops (small/quantized decode matmuls) stay serial as threads rise. */
+int  ember_should_parallel(long work);
+
 #endif /* EMBER_KERNELS_H */

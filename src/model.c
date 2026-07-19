@@ -156,6 +156,59 @@ void ember_state_free(EmberState *s) {
     free(s);
 }
 
+/* One query position's attention over the cache, parallelized across heads.
+ * Heads are independent (each owns its att[h*ctx] slice and out[h*hd] slice),
+ * so this is a clean data-parallel loop. Threading it is what keeps long-context
+ * decode from becoming serial-attention-bound (see report.md). */
+typedef struct {
+    const float *q;      /* query, [nh*hd]                              */
+    float *att;          /* scratch scores, [nh*ctx]                    */
+    float *out;          /* attention output, [nh*hd]                   */
+    const float *kcache; /* this layer's key cache base                 */
+    const float *vcache; /* this layer's value cache base               */
+    int pos, hd, kv_dim, kv_mul, ctx;
+    float inv_sqrt;
+} AttnCtx;
+
+static void attn_heads(void *c, int h0, int h1) {
+    AttnCtx *a = c;
+    for (int h = h0; h < h1; h++) {
+        const float *qh = a->q + (size_t)h * a->hd;
+        float *att = a->att + (size_t)h * a->ctx;
+        int kvh = h / a->kv_mul;
+        for (int t = 0; t <= a->pos; t++) {
+            const float *kt = a->kcache + (size_t)t * a->kv_dim + kvh * a->hd;
+            float sc = 0.0f;
+            for (int i = 0; i < a->hd; i++) sc += qh[i] * kt[i];
+            att[t] = sc * a->inv_sqrt;
+        }
+        softmax(att, a->pos + 1);
+        float *out = a->out + (size_t)h * a->hd;
+        for (int i = 0; i < a->hd; i++) out[i] = 0.0f;
+        for (int t = 0; t <= a->pos; t++) {
+            const float *vt = a->vcache + (size_t)t * a->kv_dim + kvh * a->hd;
+            float w = att[t];
+            for (int i = 0; i < a->hd; i++) out[i] += w * vt[i];
+        }
+    }
+}
+
+/* Run one query position's attention, threading over heads only when the work
+ * (≈ nh * context * head_dim) is large enough to amortize dispatch. */
+static void attention(EmberState *s, const float *q, float *out, int l, int pos,
+                      int nh, int hd, int kv_dim, int kv_mul) {
+    AttnCtx ac = {
+        q, s->att, out,
+        s->key_cache   + (size_t)l * s->ctx * kv_dim,
+        s->value_cache + (size_t)l * s->ctx * kv_dim,
+        pos, hd, kv_dim, kv_mul, s->ctx, 1.0f / sqrtf((float)hd)
+    };
+    if (ember_should_parallel((long)nh * (pos + 1) * hd))
+        ember_parallel_for(attn_heads, &ac, nh);
+    else
+        attn_heads(&ac, 0, nh);
+}
+
 /* Batched prefill: process ids[0..n) at positions start..start+n-1, filling the
  * KV cache, and return logits for the LAST token only. Streams each weight row
  * once for all n tokens (GEMM), which is far faster than n single-token passes. */
@@ -205,29 +258,9 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
                    Vb + (size_t)b * kv_dim, sizeof(float) * kv_dim);
         }
 
-        float inv_sqrt = 1.0f / sqrtf((float)hd);
-        for (int b = 0; b < n; b++) {
-            int pos = start + b;
-            for (int h = 0; h < nh; h++) {
-                const float *qh = Q + (size_t)b * qd + h * hd;
-                float *att = s->att + h * s->ctx;
-                int kvh = h / kv_mul;
-                for (int t = 0; t <= pos; t++) {
-                    const float *kt = s->key_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
-                    float sc = 0.0f;
-                    for (int i = 0; i < hd; i++) sc += qh[i] * kt[i];
-                    att[t] = sc * inv_sqrt;
-                }
-                softmax(att, pos + 1);
-                float *out = Ob + (size_t)b * qd + h * hd;
-                for (int i = 0; i < hd; i++) out[i] = 0.0f;
-                for (int t = 0; t <= pos; t++) {
-                    const float *vt = s->value_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
-                    float a = att[t];
-                    for (int i = 0; i < hd; i++) out[i] += a * vt[i];
-                }
-            }
-        }
+        for (int b = 0; b < n; b++)
+            attention(s, Q + (size_t)b * qd, Ob + (size_t)b * qd, l,
+                      start + b, nh, hd, kv_dim, kv_mul);
 
         ember_matmul_batch(Tmp, Ob, s->wo[l].data, s->wo[l].dtype, qd, dim, n, xqb);
         for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += Tmp[i];
@@ -277,26 +310,7 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
         rope(s->q, nh * hd, hd, pos, s->rope_theta, s->rope_style);
         rope(k, kv_dim, hd, pos, s->rope_theta, s->rope_style);
 
-        float inv_sqrt = 1.0f / sqrtf((float)hd);
-        for (int h = 0; h < nh; h++) {
-            const float *qh = s->q + h * hd;
-            float *att = s->att + h * s->ctx;
-            int kvh = h / kv_mul;
-            for (int t = 0; t <= pos; t++) {
-                const float *kt = s->key_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
-                float score = 0.0f;
-                for (int i = 0; i < hd; i++) score += qh[i] * kt[i];
-                att[t] = score * inv_sqrt;
-            }
-            softmax(att, pos + 1);
-            float *out = s->xb + h * hd;
-            for (int i = 0; i < hd; i++) out[i] = 0.0f;
-            for (int t = 0; t <= pos; t++) {
-                const float *vt = s->value_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
-                float a = att[t];
-                for (int i = 0; i < hd; i++) out[i] += a * vt[i];
-            }
-        }
+        attention(s, s->q, s->xb, l, pos, nh, hd, kv_dim, kv_mul);
 
         ember_matmul(s->xb2, s->xb, s->wo[l].data, s->wo[l].dtype, nh * hd, dim, s->xq);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];

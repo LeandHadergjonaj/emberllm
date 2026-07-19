@@ -226,8 +226,8 @@ void ember_matmul(float *out, const float *x, const void *w, int dtype,
         xin = xq;
     }
     MMCtx c = { out, xin, w, n_in, dtype };
-    /* Parallelize only when there is enough work to amortize dispatch. */
-    if (ember_nthreads() > 1 && (long)n_in * d_out >= (1 << 15))
+    /* Parallelize only when each thread gets enough work to amortize dispatch. */
+    if (ember_should_parallel((long)n_in * d_out))
         ember_parallel_for(mm_rows, &c, d_out);
     else
         mm_rows(&c, 0, d_out);
@@ -271,7 +271,7 @@ void ember_matmul_batch(float *out, const float *x, const void *w, int dtype,
         xin = xq;
     }
     MMBatch c = { out, xin, w, n_in, d_out, dtype, B };
-    if (ember_nthreads() > 1 && (long)n_in * d_out * B >= (1 << 15))
+    if (ember_should_parallel((long)n_in * d_out * B))
         ember_parallel_for(mmb_rows, &c, d_out);
     else
         mmb_rows(&c, 0, d_out);

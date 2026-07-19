@@ -81,6 +81,10 @@ void ember_threads_shutdown(void) {
 
 int ember_nthreads(void) { return g_nthreads; }
 
+int ember_should_parallel(long work) {
+    return g_nthreads > 1 && work >= (long)EMBER_PAR_MIN_PER_THREAD * g_nthreads;
+}
+
 void ember_parallel_for(EmberRangeFn fn, void *ctx, int n) {
     if (g_nthreads <= 1) { fn(ctx, 0, n); return; }
 

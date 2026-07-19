@@ -83,6 +83,35 @@ static int cmd_tokenize(int argc, char **argv) {
     return 0;
 }
 
+/* Auto-tune the decode thread count by measuring: a fixed flop-based gate can't
+ * tell that small quantized decode matmuls are memory-bound and don't parallelize,
+ * so we just time a few forward() passes at each candidate count and keep the
+ * fastest. The warm-up passes write throwaway KV entries at low positions, which
+ * real generation overwrites from pos 0 (and never reads past its own position),
+ * so this is safe to run on a fresh state before prefill. */
+static int autotune_threads(EmberModel *m, EmberState *s) {
+    static const int cand[] = { 1, 2, 4, 6 };
+    int best = 1;
+    double best_rate = 0.0;
+    for (size_t i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        int c = cand[i];
+        ember_threads_init(c);
+        for (int p = 0; p < 3; p++) ember_forward(m, s, 0, p);       /* warm up */
+        double t0 = now_sec();
+        int N = 12;
+        for (int k = 0; k < N; k++) ember_forward(m, s, 0, 3 + (k % 28));
+        double rate = N / (now_sec() - t0);
+        ember_threads_shutdown();
+        if (rate > best_rate) { best_rate = rate; best = c; }
+    }
+    ember_threads_init(best);
+    fprintf(stderr, "[autotuned decode: %d thread(s), ~%.0f tok/s]\n", best, best_rate);
+    return best;
+}
+
+/* Parse a --threads value that may be the literal "auto" (sentinel -1). */
+static int parse_threads(const char *v) { return strcmp(v, "auto") == 0 ? -1 : atoi(v); }
+
 static int cmd_generate(int argc, char **argv) {
     const char *path = argv[0], *prompt = "";
     int max_new = 256, ctx = 0, threads = 1, top_k = -1;
@@ -96,7 +125,7 @@ static int cmd_generate(int argc, char **argv) {
         else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) top_k = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_threads(argv[++i]);
     }
 
     EmberModel *m = ember_model_load(path);
@@ -107,9 +136,10 @@ static int cmd_generate(int argc, char **argv) {
     if (top_k < 0) top_k = h->default_top_k;
     if (seed == 0) seed = 0xC0FFEEULL;
 
-    ember_threads_init(threads);
     EmberTokenizer *tok = ember_tokenizer_new(m);
     EmberState *st = ember_state_new(m, ctx);
+    if (threads < 0) threads = autotune_threads(m, st); /* --threads auto */
+    else ember_threads_init(threads);
     EmberSampler smp;
     ember_sampler_init(&smp, temp, top_p, top_k, seed);
 
@@ -239,7 +269,7 @@ static int cmd_chat(int argc, char **argv) {
     float temp = -1.0f, top_p = -1.0f;
     uint64_t seed = 0;
     for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = atoi(argv[++i]);
+        if      (!strcmp(argv[i], "--threads") && i + 1 < argc) threads = parse_threads(argv[++i]);
         else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) ctx = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-n") && i + 1 < argc) max_new = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--system") && i + 1 < argc) system = argv[++i];
@@ -259,9 +289,10 @@ static int cmd_chat(int argc, char **argv) {
     if (seed == 0) seed = 0xC0FFEEULL;
     if (ctx > h->max_seq_len) ctx = h->max_seq_len;
 
-    ember_threads_init(threads);
     EmberTokenizer *tok = ember_tokenizer_new(m);
     EmberState *st = ember_state_new(m, ctx);
+    if (threads < 0) threads = autotune_threads(m, st); /* --threads auto */
+    else ember_threads_init(threads);
     EmberSampler smp;
     ember_sampler_init(&smp, temp, top_p, top_k, seed);
 
@@ -377,9 +408,9 @@ int main(int argc, char **argv) {
             "  ember info     <model.ember>\n"
             "  ember tokenize <model.ember> \"text\"\n"
             "  ember generate <model.ember> [-p PROMPT] [-n N] [-t TEMP]\n"
-            "                 [--top-p P] [--top-k K] [--seed S] [--ctx C] [--threads T]\n"
+            "                 [--top-p P] [--top-k K] [--seed S] [--ctx C] [--threads T|auto]\n"
             "  ember chat     <model.ember> [--system S] [--think] [-n N] [-t TEMP]\n"
-            "                 [--ctx C] [--threads T] [--top-p P] [--top-k K] [--seed S]\n"
+            "                 [--ctx C] [--threads T|auto] [--top-p P] [--top-k K] [--seed S]\n"
             "  ember bench    <model.ember> [--pp P] [--tg N] [--threads T] [--reps R]\n"
             "  ember quantize <in.ember> <out.ember> [q8_0|q4_0]\n");
         return 1;
