@@ -93,6 +93,19 @@ else
     echo "  FAIL: fp16 KV output empty or malformed"; echo "    got: $k16"; fail=1
 fi
 
+echo "== test 8: libember + Python bindings =="
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "  skip: python3 not available"
+else
+    make lib >/dev/null 2>&1
+    out=$(python3 bindings/python/example.py "$MODEL" "Once upon a time" 2>/dev/null)
+    if printf '%s' "$out" | grep -q "Once upon a time"; then
+        echo "  ok: libember loads via ctypes and generates coherent text"
+    else
+        echo "  FAIL: python binding output empty or malformed"; echo "    got: $out"; fail=1
+    fi
+fi
+
 echo "== test 6: HTTP server (OpenAI-compatible) =="
 if ! command -v curl >/dev/null 2>&1; then
     echo "  skip: curl not available"
