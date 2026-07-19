@@ -282,9 +282,13 @@ static int next_piece(const char *s, int slen) {
         if (c0 == ' ') i = 1;
         if (i < slen) { unsigned char c = s[i];
             if (!is_space(c) && !is_letter_ext(c) && !is_digit(c)) {
-                int j = i; while (j < slen) { unsigned char cc = s[j];
-                    if (is_space(cc) || is_letter_ext(cc) || is_digit(cc)) break; j++; }
-                while (j < slen && (s[j]=='\r'||s[j]=='\n')) j++;
+                int j = i;
+                while (j < slen) {
+                    unsigned char cc = s[j];
+                    if (is_space(cc) || is_letter_ext(cc) || is_digit(cc)) break;
+                    j++;
+                }
+                while (j < slen && (s[j] == '\r' || s[j] == '\n')) j++;
                 return j;
             }
         }

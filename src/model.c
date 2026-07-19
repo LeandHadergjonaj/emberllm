@@ -167,7 +167,9 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
     float eps = s->norm_eps;
     int qd = nh * hd;
 
-    int wide = dim; if (hidden > wide) wide = hidden; if (qd > wide) wide = qd;
+    int wide = dim;
+    if (hidden > wide) wide = hidden;
+    if (qd > wide) wide = qd;
     float *X   = malloc(sizeof(float) * (size_t)n * dim);
     float *Xn  = malloc(sizeof(float) * (size_t)n * dim);
     float *Tmp = malloc(sizeof(float) * (size_t)n * dim);

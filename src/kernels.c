@@ -107,8 +107,8 @@ void ember_quantize_q4_0(const float *x, BlockQ4_0 *out, int n) {
         for (int i = 0; i < EMBER_Q_BLOCK / 2; i++) {
             int q0 = (int)(xb[i] * id + 8.5f);
             int q1 = (int)(xb[i + EMBER_Q_BLOCK / 2] * id + 8.5f);
-            if (q0 < 0) q0 = 0; if (q0 > 15) q0 = 15;
-            if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+            q0 = q0 < 0 ? 0 : (q0 > 15 ? 15 : q0);
+            q1 = q1 < 0 ? 0 : (q1 > 15 ? 15 : q1);
             out[b].qs[i] = (uint8_t)(q0 | (q1 << 4));
         }
     }
