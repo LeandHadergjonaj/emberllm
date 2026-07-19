@@ -85,6 +85,50 @@ else
 fi
 rm -f "$garbage"
 
+echo "== test 6: HTTP server (OpenAI-compatible) =="
+if ! command -v curl >/dev/null 2>&1; then
+    echo "  skip: curl not available"
+else
+    if [ ! -x ./ember ]; then make >/dev/null; fi
+    PORT=18723
+    ./ember serve "$MODEL" --port "$PORT" >/dev/null 2>&1 &
+    SRV=$!
+    # wait for the port to come up (up to ~5s)
+    up=0
+    for _ in $(seq 1 50); do
+        if curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then up=1; break; fi
+        sleep 0.1
+    done
+    if [ "$up" -ne 1 ]; then
+        echo "  FAIL: server did not start"; fail=1
+    else
+        health=$(curl -s "http://127.0.0.1:$PORT/health")
+        [ "$health" = '{"status":"ok"}' ] && echo "  ok: /health" || { echo "  FAIL: /health = $health"; fail=1; }
+
+        body='{"messages":[{"role":"user","content":"Once upon a time"}],"max_tokens":8,"temperature":0}'
+        resp=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "$body")
+        if printf '%s' "$resp" | grep -q '"object":"chat.completion"'; then
+            echo "  ok: POST /v1/chat/completions returns a completion"
+        else
+            echo "  FAIL: chat completion malformed"; echo "    got: $resp"; fail=1
+        fi
+
+        sbody='{"messages":[{"role":"user","content":"Once upon a time"}],"max_tokens":8,"temperature":0,"stream":true}'
+        sresp=$(curl -s -N "http://127.0.0.1:$PORT/v1/chat/completions" \
+                 -H 'Content-Type: application/json' -d "$sbody")
+        if printf '%s' "$sresp" | grep -q 'data: \[DONE\]'; then
+            echo "  ok: SSE stream terminates with [DONE]"
+        else
+            echo "  FAIL: SSE stream missing [DONE]"; fail=1
+        fi
+
+        code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/v1/bogus")
+        [ "$code" = "404" ] && echo "  ok: unknown route -> 404" || { echo "  FAIL: bogus route = $code"; fail=1; }
+    fi
+    kill "$SRV" 2>/dev/null
+    wait "$SRV" 2>/dev/null
+fi
+
 echo "== test 2: greedy transcript =="
 if [ "${EMBER_SKIP_TRANSCRIPT:-0}" = "1" ]; then
     echo "  skip: not the reference platform (fp reductions are not bit-portable)"

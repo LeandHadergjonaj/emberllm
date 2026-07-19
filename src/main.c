@@ -9,6 +9,7 @@
  */
 #include "ember.h"
 #include "kernels.h"
+#include "server.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -457,6 +458,57 @@ static int cmd_perplexity(int argc, char **argv) {
     return 0;
 }
 
+static const char SERVE_HELP[] =
+    "usage: ember serve <model.ember> [options]\n"
+    "  --host H             bind address (default 127.0.0.1)\n"
+    "  --port P             listen port (default 8080)\n"
+    "  --ctx C              context length (default: model max)\n"
+    "  --threads T|auto     decode threads (default 1)\n"
+    "  --think              allow <think> reasoning in replies (Qwen-style)\n"
+    "  -n N                 default max_tokens when a request omits it (default 512)\n"
+    "  -t TEMP              default temperature\n"
+    "  --top-p P            default nucleus threshold\n"
+    "  --top-k K            default top-k\n"
+    "  --repeat-penalty R   default repetition penalty (default 1.1)\n"
+    "  --seed S             base RNG seed\n"
+    "\n"
+    "Exposes an OpenAI-compatible API: POST /v1/chat/completions (SSE when\n"
+    "\"stream\": true), GET /v1/models, GET /health. Single stream at a time.\n";
+
+static int cmd_serve(int argc, char **argv) {
+    if (argc < 1 || has_help(argc, argv)) { fputs(SERVE_HELP, stdout); return argc < 1; }
+    ServeConfig cfg = {
+        .host = "127.0.0.1", .port = 8080, .threads = 1, .ctx = 0, .think = 0,
+        .max_tokens = 512, .temperature = -1.0f, .top_p = -1.0f, .top_k = -1,
+        .repeat_penalty = 1.1f, .seed = 0xC0FFEEULL,
+    };
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "--host") && i + 1 < argc) cfg.host = argv[++i];
+        else if (!strcmp(argv[i], "--port") && i + 1 < argc) cfg.port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) cfg.ctx = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--threads") && i + 1 < argc) cfg.threads = parse_threads(argv[++i]);
+        else if (!strcmp(argv[i], "--think")) cfg.think = 1;
+        else if (!strcmp(argv[i], "-n") && i + 1 < argc) cfg.max_tokens = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) cfg.temperature = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-p") && i + 1 < argc) cfg.top_p = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--top-k") && i + 1 < argc) cfg.top_k = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--repeat-penalty") && i + 1 < argc) cfg.repeat_penalty = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--seed") && i + 1 < argc) cfg.seed = strtoull(argv[++i], NULL, 10);
+        else { fprintf(stderr, "ember: unknown serve option '%s'\n", argv[i]); return 1; }
+    }
+
+    /* fill sampling defaults from the model header where the user left them auto */
+    EmberModel *probe = ember_model_load(argv[0]);
+    if (!probe) return 1;
+    const EmberHeader *h = ember_model_header(probe);
+    if (cfg.temperature < 0) cfg.temperature = h->default_temp;
+    if (cfg.top_p < 0) cfg.top_p = h->default_top_p;
+    if (cfg.top_k < 0) cfg.top_k = h->default_top_k;
+    ember_model_free(probe);
+
+    return ember_serve(argv[0], &cfg);
+}
+
 static int cmd_quantize(int argc, char **argv) {
     if (argc < 2) { fprintf(stderr, "usage: ember quantize <in.ember> <out.ember> [q8_0|q4_0]\n"); return 1; }
     int target = EMBER_DT_Q8_0;
@@ -473,6 +525,7 @@ static const char TOP_USAGE[] =
     "  tokenize   <model.ember> \"text\"           encode text to token ids\n"
     "  generate   <model.ember> [options]       one-shot text completion\n"
     "  chat       <model.ember> [options]       interactive chat (ChatML)\n"
+    "  serve      <model.ember> [options]       OpenAI-compatible HTTP server\n"
     "  bench      <model.ember> [options]       prefill/decode throughput\n"
     "  perplexity <model.ember> <textfile>      quality gate over a corpus\n"
     "  quantize   <in.ember> <out.ember> [q8_0|q4_0]   requantize weights\n";
@@ -487,6 +540,7 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "tokenize")) return cmd_tokenize(argc - 2, argv + 2);
     if (!strcmp(argv[1], "generate")) return cmd_generate(argc - 2, argv + 2);
     if (!strcmp(argv[1], "chat"))     return cmd_chat(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "serve"))    return cmd_serve(argc - 2, argv + 2);
     if (!strcmp(argv[1], "bench"))    return cmd_bench(argc - 2, argv + 2);
     if (!strcmp(argv[1], "perplexity")) return cmd_perplexity(argc - 2, argv + 2);
     if (!strcmp(argv[1], "quantize")) return cmd_quantize(argc - 2, argv + 2);

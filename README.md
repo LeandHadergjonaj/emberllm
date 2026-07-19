@@ -1,9 +1,10 @@
 # emberllm
 
-A CPU-only LLM inference engine, written from scratch in ~2,300 lines of C11.
+A CPU-only LLM inference engine, written from scratch in ~3,200 lines of C11.
 No GPU, no runtime dependencies, one `Makefile`. It runs a 110M-parameter model
-at **~260 tokens/second** and holds a real chat with **Qwen3-0.6B at ~60 tok/s**
-on a plain laptop CPU.
+at **~260 tokens/second**, holds a real chat with **Qwen3-0.6B at ~60 tok/s** on
+a plain laptop CPU, and serves an **OpenAI-compatible API** so it drops in behind
+tools that already speak it.
 
 ```
 $ ./ember chat models/qwen3-0.6b-q8.ember --threads auto
@@ -44,6 +45,46 @@ No weights are committed; `download.sh` fetches them from Hugging Face and the
 converter turns them into a single self-describing `.ember` file.
 
 Every subcommand documents itself: `ember generate --help`, `ember chat --help`, etc.
+
+## Run it as a server
+
+`ember serve` turns the engine into a drop-in local backend for anything that
+speaks the OpenAI API — chat UIs, editor plugins, agent frameworks — with no
+extra dependencies (the HTTP server and JSON reader are hand-rolled in
+[`src/server.c`](src/server.c) and [`src/json.c`](src/json.c)).
+
+```sh
+ember serve models/qwen3-0.6b-q8.ember --port 8080 --threads auto
+```
+
+```sh
+# non-streaming
+curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Write a haiku about winter."}]
+}'
+
+# token streaming (Server-Sent Events)
+curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Count to five."}],
+  "stream": true
+}'
+```
+
+It exposes **`POST /v1/chat/completions`** (with SSE streaming when
+`"stream": true`), **`GET /v1/models`**, and **`GET /health`**. Requests honour
+`temperature`, `top_p`, `top_k`, `max_tokens`, `stop` (string or array),
+`repeat_penalty`, and `presence/frequency_penalty`. It also works from the OpenAI
+Python client by pointing `base_url` at it:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+r = client.chat.completions.create(model="ember", messages=[{"role":"user","content":"hi"}])
+```
+
+Scope is deliberately **single-stream**: one request is served at a time, using
+the same KV cache and forward pass as the CLI. The prompt is assembled with the
+ChatML template, so `serve` targets ChatML chat models (e.g. Qwen3).
 
 ## Sampling and reproducibility
 
@@ -133,8 +174,10 @@ src/threads.c     fork-join thread pool
 src/tokenizer.c   SentencePiece-BPE and byte-level BPE, both from scratch
 src/quant.c       offline fp32 -> Q8_0/Q4_0
 src/sample.c      greedy / temperature / top-k / top-p / min-p + repeat penalties
+src/server.c      hand-rolled OpenAI-compatible HTTP/1.1 server (SSE streaming)
+src/json.c        tiny dependency-free JSON reader (for request bodies)
 src/util.c        checked allocation + fatal-error helpers
-src/main.c        info | tokenize | generate | chat | bench | perplexity | quantize
+src/main.c        info | tokenize | generate | chat | serve | bench | perplexity | quantize
 tools/convert.py  llama2.c and Qwen3-safetensors -> .ember (numpy only, no torch)
 ```
 
