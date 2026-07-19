@@ -128,9 +128,11 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->lm_head = (h->flags & EMBER_FLAG_TIED_EMBED) ? s->tok_emb : tref(m, "lm_head", -1);
 
     int hd = s->head_dim, nh = s->n_heads;
+    int qd = nh * hd; /* query width; with decoupled head_dim this can exceed dim */
     int wide = s->hidden > s->dim ? s->hidden : s->dim;
+    if (qd > wide) wide = qd;
     s->x = malloc(sizeof(float) * s->dim);
-    s->xb = malloc(sizeof(float) * s->dim);
+    s->xb = malloc(sizeof(float) * (qd > s->dim ? qd : s->dim)); /* holds attn output (qd) */
     s->xb2 = malloc(sizeof(float) * s->dim);
     s->hb = malloc(sizeof(float) * s->hidden);
     s->hb2 = malloc(sizeof(float) * s->hidden);

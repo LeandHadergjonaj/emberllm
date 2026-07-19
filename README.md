@@ -1,16 +1,150 @@
 # emberllm
 
-A CPU-only LLM inference engine, written from scratch in C11. No GPU, no runtime dependencies — the goal is visibly fast text generation on ordinary hardware, and code small enough to read in an afternoon.
+A CPU-only LLM inference engine, written from scratch in ~2,000 lines of C11.
+No GPU, no runtime dependencies, one `Makefile`. It runs a 110M-parameter model
+at **~260 tokens/second** and holds a real chat with **Qwen3-0.6B at ~60 tok/s**
+on a plain laptop CPU.
 
-**Status: planning.** No engine code yet. The full staged build plan — target models, optimization roadmap, validation strategy, and honest performance targets — lives in **[PLAN.md](PLAN.md)**.
+```
+$ ./ember chat models/qwen3-0.6b-q8.ember --threads 6
 
-## What this will become
+> Write a haiku about winter.
+A frost-kissed sky
+Whispers of snow on the wind,
+A quiet winter's embrace.
+```
 
-- A single `ember` binary that loads a self-describing `.ember` weight file (mmap, instant startup) and streams tokens in the terminal with a live tok/s counter.
-- Bring-up on the TinyStories models (llama2.c lineage), ending at **Qwen3-0.6B instruct chat** — the best sub-1B chat model — running quantized on a plain M-series CPU.
-- The optimization arc, staged and measured honestly against the memory-bandwidth roofline: fp32 baseline → pthreads → NEON kernels → Q8_0/Q4_0 quantization → chunked prefill.
-- Zero runtime dependencies: hand-written tokenizers, threadpool, and SIMD kernels; one Makefile; a one-time Python conversion script (`safetensors` + `numpy` only).
+```
+$ ./ember generate models/stories110M-q8.ember -p "Once upon a time"
+Once upon a time, there was a little boy named Timmy. Timmy loved to play
+outside in the sunshine. One day, Timmy was walking in the forest when he saw
+a giant. The giant was very tall and had a big smile on his face...
+[prefill 5 tok @ 292 tok/s | decode 128 tok @ 259 tok/s | 1 thread]
+```
 
-Inspired by the genre of [llama2.c](https://github.com/karpathy/llama2.c), [llama.cpp](https://github.com/ggml-org/llama.cpp), and [calm](https://github.com/zeux/calm) — techniques reimplemented independently, no code copied.
+A [VHS](https://github.com/charmbracelet/vhs) tape for the demo GIF lives at
+[`bench/demo.tape`](bench/demo.tape) — regenerate with `vhs bench/demo.tape`.
 
-License: MIT.
+## Quickstart
+
+```sh
+git clone https://github.com/LeandHadergjonaj/emberllm && cd emberllm
+make                              # builds ./ember (C11, uses NEON/AVX where present)
+
+# a 110M TinyStories model — MIT-licensed, fun, and fast
+./tools/download.sh stories110M   # fetches weights, converts, quantizes to Q8_0
+./ember generate models/stories110M-q8.ember -p "Once upon a time"
+
+# a real chat model — Qwen3-0.6B (needs: pip install numpy safetensors)
+./tools/download.sh qwen3-0.6b
+./ember chat models/qwen3-0.6b-q8.ember --threads 6
+```
+
+No weights are committed; `download.sh` fetches them from Hugging Face and the
+converter turns them into a single self-describing `.ember` file.
+
+## Measured performance
+
+Apple M1 Pro (6 performance cores), single stream. `pp` = prompt processing
+(prefill), `tg` = token generation (decode). Numbers are `ember bench` means
+over 5 runs; **measure your own hardware before quoting these.**
+
+| Model | build | threads | decode | prefill |
+|---|---|---:|---:|---:|
+| stories110M | naive (`-O0`, scalar, fp32) | 1 | 8.8 tok/s | — |
+| stories110M | optimized (Q8_0 + NEON) | 1 | **259 tok/s** | 292 tok/s |
+| Qwen3-0.6B | Q8_0 + NEON | 1 | 50 tok/s | — |
+| Qwen3-0.6B | Q8_0 + NEON | 6 | **64 tok/s** | 176 tok/s |
+
+Those first two rows are the same 110M weights: **~29× from the naive build to
+the optimized one**, purely from engineering. Run it yourself:
+
+```sh
+./bench/race.sh          # naive vs optimized, side by side
+./ember bench models/qwen3-0.6b-q8.ember --pp 128 --tg 128 --threads 6
+```
+
+## How it works
+
+Single-stream decode on a CPU is **memory-bandwidth-bound**: to generate one
+token the engine streams essentially the whole weight file through the cores, so
+
+> tokens/second ≈ memory bandwidth ÷ bytes per token
+
+Everything in emberllm follows from that one fact:
+
+- **Quantization is the biggest lever.** `Q8_0` (8-bit, 32-weight blocks with an
+  fp16 scale) cuts bytes-per-token ~4× versus fp32 and is near-lossless — its
+  perplexity is within 0.3% of fp32 on this model. `Q4_0` halves it again for
+  some quality cost. Quantization is done offline by `ember quantize`.
+- **Threads help until bandwidth saturates.** A hand-rolled pool splits each
+  matmul across cores. Big models (Qwen3) scale to ~6 threads; the tiny 110M
+  model is already bandwidth/overhead-bound at one thread and doesn't benefit —
+  which is exactly what the roofline predicts.
+- **SIMD keeps a core from going compute-bound.** NEON (`sdot`) on Apple Silicon,
+  AVX2 on x86, with a scalar fallback. The single biggest kernel win was doing
+  fp16→fp32 scale conversion in one hardware instruction instead of by hand.
+- **Batched-GEMM prefill** streams each weight row once for the whole prompt
+  (2.6× faster time-to-first-token than one-token-at-a-time).
+- **mmap** loads weights with zero copies for instant startup.
+
+The optimization ladder, on the same 110M model: naive fp32 (~9 tok/s) →
+`-O3` + NEON → multithreading → **Q8_0 quantization** (~260 tok/s).
+
+## What's in the box
+
+```
+src/ember.h       the .ember file format + public API
+src/io.c          mmap loader
+src/model.c       forward pass: RMSNorm, RoPE, GQA attention, SwiGLU, KV cache,
+                  QK-norm, batched prefill
+src/kernels.c     matmul + dot kernels (scalar / NEON / AVX2), Q8_0/Q4_0
+src/threads.c     fork-join thread pool
+src/tokenizer.c   SentencePiece-BPE and byte-level BPE, both from scratch
+src/quant.c       offline fp32 -> Q8_0/Q4_0
+src/sample.c      greedy / temperature / top-k / top-p
+src/main.c        info | tokenize | generate | chat | bench | perplexity | quantize
+tools/convert.py  llama2.c and Qwen3-safetensors -> .ember (numpy only, no torch)
+```
+
+Two model families run through one code path, distinguished only by fields in
+the file header: TinyStories (LLaMA-2 style, SentencePiece, interleaved RoPE)
+and Qwen3 (GQA, QK-RMSNorm, decoupled head_dim, byte-level BPE, NEOX RoPE).
+
+## Correctness
+
+From-scratch inference fails on *conventions*, not math — a wrong RoPE pairing
+or GQA index produces fluent-looking garbage. So the engine is checked against
+references, not just eyeballed:
+
+- The TinyStories forward pass matches karpathy's `run.c` **token-for-token** in
+  greedy mode (`tests/run_tests.sh`, run in CI on macOS-arm + Linux x86/arm).
+- The byte-level BPE tokenizer matches Hugging Face `tokenizers` on **512/512**
+  fuzzed inputs (`tools/validate_bpe.py`).
+- `ember perplexity` gates quantization: Q8_0 stays within a hair of fp32.
+
+## Honest limitations
+
+- **Tuned for Apple Silicon / NEON.** x86 has a correct AVX2 path but hasn't been
+  performance-tuned; other targets fall back to a correct scalar build. Widening
+  and tuning the AVX2 path is the first thing on the list.
+- **`Q4_0` is smaller but not faster** here — its kernel isn't SIMD-optimized yet,
+  so `Q8_0` is the sweet spot (fast *and* near-lossless). K-quants aren't
+  implemented.
+- **fp32 KV cache.** Fine at the default 4096-token context; fp16 KV would halve
+  its memory for long contexts.
+- **The pre-tokenizer regex is approximated** (C has no `\p{L}`). It's fuzz-clean
+  on realistic English/code/Unicode but may differ from HF on pathological input.
+- Scope is single-stream inference of models up to ~1B parameters. No training,
+  batching across requests, speculative decoding, or GGUF import.
+
+## Credits
+
+Built independently, but it stands on ideas from
+[llama2.c](https://github.com/karpathy/llama2.c) (the tiny-model demo, the export
+script, and the correctness oracle), [llama.cpp](https://github.com/ggml-org/llama.cpp)
+(block quantization, mmap, benchmark methodology), and
+[calm](https://github.com/zeux/calm) (a self-describing single-file format). The
+techniques are reimplemented from scratch; no code was copied.
+
+MIT licensed. The models it runs are MIT (TinyStories) and Apache-2.0 (Qwen3).

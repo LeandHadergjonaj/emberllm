@@ -11,7 +11,7 @@ This plan is the product of a five-track research pass (model selection, CPU opt
 - **Hardware:** **Apple Silicon (NEON) first**; portable scalar build correct everywhere from day one; fast AVX2 x86 path is the first post-launch milestone. x86/ARM Linux CI from day one.
 - **License:** MIT for the code (genre standard; both target models' licenses — MIT for TinyStories weights, Apache-2.0 for Qwen3 — are compatible with pointing users at them).
 
-**Status:** planning complete; no engine code yet. Implementation begins at Stage 0 below.
+**Status:** implemented. Stages 0–4 are complete — the engine runs TinyStories and Qwen3-0.6B chat; see the [README](README.md) for measured numbers. This document is kept as the original design record.
 
 ---
 
