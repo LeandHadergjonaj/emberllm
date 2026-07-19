@@ -5,6 +5,7 @@
  * startup is dominated by page faults on first access, not by parsing.
  */
 #include "ember.h"
+#include "util.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -39,14 +40,26 @@ EmberModel *ember_model_load(const char *path) {
     if (base == MAP_FAILED) { die("mmap failed"); close(fd); return NULL; }
 
     const EmberHeader *hdr = (const EmberHeader *)base;
+    uint64_t fsize = (uint64_t)st.st_size;
     if (memcmp(hdr->magic, "EMBR", 4) != 0 || hdr->version != EMBER_VERSION) {
         die("bad magic or version"); munmap(base, st.st_size); close(fd); return NULL;
     }
-    if (hdr->tensor_table_offset + hdr->tensor_table_size > (uint64_t)st.st_size) {
+    /* Every region the header points at must lie inside the file, and the tensor
+     * table must actually hold the number of entries the header claims. Checking
+     * here means the forward pass can trust its pointers. */
+    if (hdr->n_tensors < 0 || hdr->dim <= 0 || hdr->n_layers <= 0 || hdr->vocab_size <= 0) {
+        die("header has non-positive dimensions"); munmap(base, st.st_size); close(fd); return NULL;
+    }
+    if (hdr->tensor_table_offset > fsize ||
+        hdr->tensor_table_size > fsize - hdr->tensor_table_offset ||
+        hdr->tensor_table_size < (uint64_t)hdr->n_tensors * sizeof(EmberTensor)) {
         die("tensor table out of bounds"); munmap(base, st.st_size); close(fd); return NULL;
     }
+    if (hdr->tokenizer_offset > fsize || hdr->tokenizer_size > fsize - hdr->tokenizer_offset) {
+        die("tokenizer blob out of bounds"); munmap(base, st.st_size); close(fd); return NULL;
+    }
 
-    EmberModel *m = calloc(1, sizeof(*m));
+    EmberModel *m = ember_xcalloc(1, sizeof(*m), "EmberModel");
     m->fd = fd;
     m->size = st.st_size;
     m->base = (const uint8_t *)base;

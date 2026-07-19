@@ -32,7 +32,8 @@ enum {
 /* header flag bits */
 enum {
     EMBER_FLAG_TIED_EMBED = 1u << 0, /* lm_head shares the token-embedding matrix   */
-    EMBER_FLAG_QK_NORM    = 1u << 1  /* per-head RMSNorm on Q and K before RoPE      */
+    EMBER_FLAG_QK_NORM    = 1u << 1, /* per-head RMSNorm on Q and K before RoPE      */
+    EMBER_FLAG_THINKING   = 1u << 2  /* model has a <think> reasoning mode (Qwen3)   */
 };
 
 /* rope_style */
@@ -116,7 +117,10 @@ const EmberTensor *ember_model_tensor(const EmberModel *m, const char *name);
 const void        *ember_model_data(const EmberModel *m, const EmberTensor *t);
 
 /* model.c */
-EmberState *ember_state_new(const EmberModel *m, int ctx_len);
+EmberState *ember_state_new(const EmberModel *m, int ctx_len); /* fp32 KV cache */
+/* As above, but `kv_fp16` != 0 stores the KV cache in half precision (halves its
+ * memory and the bytes attention streams at long context, for a tiny accuracy cost). */
+EmberState *ember_state_new_ex(const EmberModel *m, int ctx_len, int kv_fp16);
 void        ember_state_free(EmberState *s);
 /* Run one forward pass for token `tok` at position `pos`; returns logits
  * (length vocab_size), owned by the state. */
@@ -138,10 +142,29 @@ typedef struct {
     float temperature;
     float top_p;
     int   top_k;
+    float min_p;             /* keep tokens with prob >= min_p * p_max (0 = off) */
+    float repeat_penalty;    /* divide/scale repeated-token logits (1.0 = off)   */
+    float presence_penalty;  /* flat subtract for any token seen in the window   */
+    float frequency_penalty; /* subtract per occurrence in the window            */
+    int   repeat_last_n;     /* penalty window length; 0 disables the history    */
     uint64_t rng_state;
+
+    /* token-history ring used by the penalties (owned; NULL when unused) */
+    int  *history;
+    int   hist_cap, hist_len, hist_pos;
 } EmberSampler;
 
 void ember_sampler_init(EmberSampler *s, float temp, float top_p, int top_k, uint64_t seed);
+/* Configure the repetition/presence/frequency/min-p controls. Allocates (or
+ * frees) the history ring as needed; safe to call once after init. */
+void ember_sampler_set_penalties(EmberSampler *s, float repeat_penalty, int repeat_last_n,
+                                 float presence_penalty, float frequency_penalty, float min_p);
+/* Feed an already-chosen token into the penalty history (e.g. prompt tokens).
+ * ember_sample() calls this for the token it returns, so callers only need it
+ * to seed prior context. */
+void ember_sampler_accept(EmberSampler *s, int token);
+void ember_sampler_reset(EmberSampler *s);  /* clear history for a new sequence   */
+void ember_sampler_free(EmberSampler *s);   /* release the history ring           */
 int  ember_sample(EmberSampler *s, float *logits, int n);
 
 /* quant.c — offline requantization (target: EMBER_DT_Q8_0 or EMBER_DT_Q4_0) */

@@ -3,6 +3,8 @@
 /ember-baseline
 /ember-debug
 *.o
+*.a
+*.so
 *.dSYM/
 
 # upstream reference (test oracle only — not part of this project)

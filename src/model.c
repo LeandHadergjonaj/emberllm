@@ -6,6 +6,7 @@
  */
 #include "ember.h"
 #include "kernels.h"
+#include "util.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -24,11 +25,27 @@ struct EmberState {
     Wt *wq, *wk, *wv, *wo, *w1, *w2, *w3;
     const float *final_norm;
     const float **attn_norm, **ffn_norm, **q_norm, **k_norm;
+    const float **b_q, **b_k, **b_v; /* optional attention biases (Qwen2.5); NULL if absent */
 
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits;
-    float *key_cache, *value_cache;
+    void  *key_cache, *value_cache; /* float* (fp32) or uint16_t* (fp16), per kv_fp16 */
+    int    kv_fp16;                 /* 1 -> KV cache stored as fp16 (half the memory)  */
+    float *kbuf, *vbuf;             /* per-step K/V scratch (decode), always fp32       */
     BlockQ8_0 *xq; /* scratch: quantized activation for q8/q4 matmuls */
 };
+
+/* Write one position's K and V (kv_dim floats each) into the cache for layer l,
+ * converting to fp16 when the cache is half-precision. */
+static void kv_store(EmberState *s, int l, int pos, const float *k, const float *v) {
+    size_t off = ((size_t)l * s->ctx + pos) * s->kv_dim;
+    if (s->kv_fp16) {
+        uint16_t *kc = (uint16_t *)s->key_cache + off, *vc = (uint16_t *)s->value_cache + off;
+        for (int i = 0; i < s->kv_dim; i++) { kc[i] = ember_f16c(k[i]); vc[i] = ember_f16c(v[i]); }
+    } else {
+        memcpy((float *)s->key_cache + off,   k, sizeof(float) * s->kv_dim);
+        memcpy((float *)s->value_cache + off, v, sizeof(float) * s->kv_dim);
+    }
+}
 
 static void rmsnorm(float *out, const float *x, const float *weight, int n, float eps) {
     float ss = 0.0f;
@@ -73,6 +90,7 @@ static void dequant_q8_row(const BlockQ8_0 *row, int n, float *out) {
 }
 
 static void embed_row(const Wt *w, int tok, int dim, float *out) {
+    if (!w->data) ember_die("model is missing its token-embedding tensor");
     if (w->dtype == EMBER_DT_F32) {
         memcpy(out, (const float *)w->data + (size_t)tok * dim, sizeof(float) * dim);
     } else { /* Q8_0 embedding table */
@@ -96,9 +114,14 @@ static const float *tref_f32(const EmberModel *m, const char *fmt, int l) {
 }
 
 EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
+    return ember_state_new_ex(m, ctx_len, 0);
+}
+
+EmberState *ember_state_new_ex(const EmberModel *m, int ctx_len, int kv_fp16) {
     const EmberHeader *h = ember_model_header(m);
-    EmberState *s = calloc(1, sizeof(*s));
+    EmberState *s = ember_xcalloc(1, sizeof(*s), "EmberState");
     s->m = m;
+    s->kv_fp16 = kv_fp16 ? 1 : 0;
     s->dim = h->dim; s->hidden = h->hidden_dim; s->n_layers = h->n_layers;
     s->n_heads = h->n_heads; s->n_kv = h->n_kv_heads; s->head_dim = h->head_dim;
     s->kv_dim = h->n_kv_heads * h->head_dim; s->vocab = h->vocab_size;
@@ -107,12 +130,17 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->ctx = (ctx_len > 0 && ctx_len < h->max_seq_len) ? ctx_len : h->max_seq_len;
 
     int L = s->n_layers;
-    s->wq = malloc(sizeof(Wt) * L); s->wk = malloc(sizeof(Wt) * L);
-    s->wv = malloc(sizeof(Wt) * L); s->wo = malloc(sizeof(Wt) * L);
-    s->w1 = malloc(sizeof(Wt) * L); s->w2 = malloc(sizeof(Wt) * L);
-    s->w3 = malloc(sizeof(Wt) * L);
-    s->attn_norm = malloc(sizeof(void *) * L); s->ffn_norm = malloc(sizeof(void *) * L);
-    s->q_norm = malloc(sizeof(void *) * L); s->k_norm = malloc(sizeof(void *) * L);
+    s->wq = ember_xmalloc(sizeof(Wt) * L, "wq"); s->wk = ember_xmalloc(sizeof(Wt) * L, "wk");
+    s->wv = ember_xmalloc(sizeof(Wt) * L, "wv"); s->wo = ember_xmalloc(sizeof(Wt) * L, "wo");
+    s->w1 = ember_xmalloc(sizeof(Wt) * L, "w1"); s->w2 = ember_xmalloc(sizeof(Wt) * L, "w2");
+    s->w3 = ember_xmalloc(sizeof(Wt) * L, "w3");
+    s->attn_norm = ember_xmalloc(sizeof(void *) * L, "attn_norm");
+    s->ffn_norm = ember_xmalloc(sizeof(void *) * L, "ffn_norm");
+    s->q_norm = ember_xmalloc(sizeof(void *) * L, "q_norm");
+    s->k_norm = ember_xmalloc(sizeof(void *) * L, "k_norm");
+    s->b_q = ember_xmalloc(sizeof(void *) * L, "b_q");
+    s->b_k = ember_xmalloc(sizeof(void *) * L, "b_k");
+    s->b_v = ember_xmalloc(sizeof(void *) * L, "b_v");
     for (int l = 0; l < L; l++) {
         s->wq[l] = tref(m, "layers.%d.wq", l); s->wk[l] = tref(m, "layers.%d.wk", l);
         s->wv[l] = tref(m, "layers.%d.wv", l); s->wo[l] = tref(m, "layers.%d.wo", l);
@@ -122,26 +150,45 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
         s->ffn_norm[l]  = tref_f32(m, "layers.%d.ffn_norm", l);
         s->q_norm[l]    = tref_f32(m, "layers.%d.q_norm", l);
         s->k_norm[l]    = tref_f32(m, "layers.%d.k_norm", l);
+        s->b_q[l]       = tref_f32(m, "layers.%d.wq_bias", l); /* optional */
+        s->b_k[l]       = tref_f32(m, "layers.%d.wk_bias", l);
+        s->b_v[l]       = tref_f32(m, "layers.%d.wv_bias", l);
     }
     s->tok_emb = tref(m, "tok_embeddings", -1);
     s->final_norm = tref_f32(m, "final_norm", -1);
     s->lm_head = (h->flags & EMBER_FLAG_TIED_EMBED) ? s->tok_emb : tref(m, "lm_head", -1);
 
+    /* Fail loudly (not with a NULL deref mid-forward) if the file is missing a
+     * tensor the forward pass will dereference. */
+    if (!s->tok_emb.data)   ember_die("model is missing tensor 'tok_embeddings'");
+    if (!s->final_norm)     ember_die("model is missing tensor 'final_norm'");
+    if (!s->lm_head.data)   ember_die("model is missing tensor 'lm_head' (and is not tied)");
+    for (int l = 0; l < L; l++) {
+        if (!s->wq[l].data || !s->wk[l].data || !s->wv[l].data || !s->wo[l].data ||
+            !s->w1[l].data || !s->w2[l].data || !s->w3[l].data ||
+            !s->attn_norm[l] || !s->ffn_norm[l])
+            ember_die("model is missing a required tensor in layer %d", l);
+    }
+
     int hd = s->head_dim, nh = s->n_heads;
     int qd = nh * hd; /* query width; with decoupled head_dim this can exceed dim */
     int wide = s->hidden > s->dim ? s->hidden : s->dim;
     if (qd > wide) wide = qd;
-    s->x = malloc(sizeof(float) * s->dim);
-    s->xb = malloc(sizeof(float) * (qd > s->dim ? qd : s->dim)); /* holds attn output (qd) */
-    s->xb2 = malloc(sizeof(float) * s->dim);
-    s->hb = malloc(sizeof(float) * s->hidden);
-    s->hb2 = malloc(sizeof(float) * s->hidden);
-    s->q = malloc(sizeof(float) * nh * hd);
-    s->att = malloc(sizeof(float) * nh * s->ctx);
-    s->logits = malloc(sizeof(float) * s->vocab);
-    s->key_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
-    s->value_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
-    s->xq = malloc(sizeof(BlockQ8_0) * (wide / EMBER_Q_BLOCK + 1));
+    s->x = ember_xmalloc(sizeof(float) * s->dim, "activation x");
+    s->xb = ember_xmalloc(sizeof(float) * (qd > s->dim ? qd : s->dim), "activation xb");
+    s->xb2 = ember_xmalloc(sizeof(float) * s->dim, "activation xb2");
+    s->hb = ember_xmalloc(sizeof(float) * s->hidden, "activation hb");
+    s->hb2 = ember_xmalloc(sizeof(float) * s->hidden, "activation hb2");
+    s->q = ember_xmalloc(sizeof(float) * nh * hd, "activation q");
+    s->att = ember_xmalloc(sizeof(float) * nh * s->ctx, "attention scores");
+    s->logits = ember_xmalloc(sizeof(float) * s->vocab, "logits");
+    size_t kv_elems = (size_t)L * s->ctx * s->kv_dim;
+    size_t kv_esize = s->kv_fp16 ? sizeof(uint16_t) : sizeof(float);
+    s->key_cache   = ember_xmalloc(kv_esize * kv_elems, "key cache");
+    s->value_cache = ember_xmalloc(kv_esize * kv_elems, "value cache");
+    s->kbuf = ember_xmalloc(sizeof(float) * s->kv_dim, "K scratch");
+    s->vbuf = ember_xmalloc(sizeof(float) * s->kv_dim, "V scratch");
+    s->xq = ember_xmalloc(sizeof(BlockQ8_0) * (wide / EMBER_Q_BLOCK + 1), "activation quant scratch");
     return s;
 }
 
@@ -150,9 +197,10 @@ void ember_state_free(EmberState *s) {
     free(s->wq); free(s->wk); free(s->wv); free(s->wo);
     free(s->w1); free(s->w2); free(s->w3);
     free(s->attn_norm); free(s->ffn_norm); free(s->q_norm); free(s->k_norm);
+    free(s->b_q); free(s->b_k); free(s->b_v);
     free(s->x); free(s->xb); free(s->xb2); free(s->hb); free(s->hb2);
     free(s->q); free(s->att); free(s->logits);
-    free(s->key_cache); free(s->value_cache); free(s->xq);
+    free(s->key_cache); free(s->value_cache); free(s->kbuf); free(s->vbuf); free(s->xq);
     free(s);
 }
 
@@ -164,9 +212,9 @@ typedef struct {
     const float *q;      /* query, [nh*hd]                              */
     float *att;          /* scratch scores, [nh*ctx]                    */
     float *out;          /* attention output, [nh*hd]                   */
-    const float *kcache; /* this layer's key cache base                 */
-    const float *vcache; /* this layer's value cache base               */
-    int pos, hd, kv_dim, kv_mul, ctx;
+    const void *kcache;  /* this layer's key cache base (fp32 or fp16)  */
+    const void *vcache;  /* this layer's value cache base (fp32 or fp16)*/
+    int pos, hd, kv_dim, kv_mul, ctx, kv_fp16;
     float inv_sqrt;
 } AttnCtx;
 
@@ -175,20 +223,37 @@ static void attn_heads(void *c, int h0, int h1) {
     for (int h = h0; h < h1; h++) {
         const float *qh = a->q + (size_t)h * a->hd;
         float *att = a->att + (size_t)h * a->ctx;
-        int kvh = h / a->kv_mul;
-        for (int t = 0; t <= a->pos; t++) {
-            const float *kt = a->kcache + (size_t)t * a->kv_dim + kvh * a->hd;
-            float sc = 0.0f;
-            for (int i = 0; i < a->hd; i++) sc += qh[i] * kt[i];
-            att[t] = sc * a->inv_sqrt;
-        }
-        softmax(att, a->pos + 1);
         float *out = a->out + (size_t)h * a->hd;
+        int kvh = h / a->kv_mul;
         for (int i = 0; i < a->hd; i++) out[i] = 0.0f;
-        for (int t = 0; t <= a->pos; t++) {
-            const float *vt = a->vcache + (size_t)t * a->kv_dim + kvh * a->hd;
-            float w = att[t];
-            for (int i = 0; i < a->hd; i++) out[i] += w * vt[i];
+        if (a->kv_fp16) {
+            const uint16_t *kc = (const uint16_t *)a->kcache, *vc = (const uint16_t *)a->vcache;
+            for (int t = 0; t <= a->pos; t++) {
+                const uint16_t *kt = kc + (size_t)t * a->kv_dim + kvh * a->hd;
+                float sc = 0.0f;
+                for (int i = 0; i < a->hd; i++) sc += qh[i] * ember_f16f(kt[i]);
+                att[t] = sc * a->inv_sqrt;
+            }
+            softmax(att, a->pos + 1);
+            for (int t = 0; t <= a->pos; t++) {
+                const uint16_t *vt = vc + (size_t)t * a->kv_dim + kvh * a->hd;
+                float w = att[t];
+                for (int i = 0; i < a->hd; i++) out[i] += w * ember_f16f(vt[i]);
+            }
+        } else {
+            const float *kc = (const float *)a->kcache, *vc = (const float *)a->vcache;
+            for (int t = 0; t <= a->pos; t++) {
+                const float *kt = kc + (size_t)t * a->kv_dim + kvh * a->hd;
+                float sc = 0.0f;
+                for (int i = 0; i < a->hd; i++) sc += qh[i] * kt[i];
+                att[t] = sc * a->inv_sqrt;
+            }
+            softmax(att, a->pos + 1);
+            for (int t = 0; t <= a->pos; t++) {
+                const float *vt = vc + (size_t)t * a->kv_dim + kvh * a->hd;
+                float w = att[t];
+                for (int i = 0; i < a->hd; i++) out[i] += w * vt[i];
+            }
         }
     }
 }
@@ -197,11 +262,14 @@ static void attn_heads(void *c, int h0, int h1) {
  * (≈ nh * context * head_dim) is large enough to amortize dispatch. */
 static void attention(EmberState *s, const float *q, float *out, int l, int pos,
                       int nh, int hd, int kv_dim, int kv_mul) {
+    size_t off = (size_t)l * s->ctx * kv_dim;
+    const void *kbase = s->kv_fp16 ? (const void *)((const uint16_t *)s->key_cache + off)
+                                   : (const void *)((const float *)s->key_cache + off);
+    const void *vbase = s->kv_fp16 ? (const void *)((const uint16_t *)s->value_cache + off)
+                                   : (const void *)((const float *)s->value_cache + off);
     AttnCtx ac = {
-        q, s->att, out,
-        s->key_cache   + (size_t)l * s->ctx * kv_dim,
-        s->value_cache + (size_t)l * s->ctx * kv_dim,
-        pos, hd, kv_dim, kv_mul, s->ctx, 1.0f / sqrtf((float)hd)
+        q, s->att, out, kbase, vbase,
+        pos, hd, kv_dim, kv_mul, s->ctx, s->kv_fp16, 1.0f / sqrtf((float)hd)
     };
     if (ember_should_parallel((long)nh * (pos + 1) * hd))
         ember_parallel_for(attn_heads, &ac, nh);
@@ -223,18 +291,22 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
     int wide = dim;
     if (hidden > wide) wide = hidden;
     if (qd > wide) wide = qd;
-    float *X   = malloc(sizeof(float) * (size_t)n * dim);
-    float *Xn  = malloc(sizeof(float) * (size_t)n * dim);
-    float *Tmp = malloc(sizeof(float) * (size_t)n * dim);
-    float *Q   = malloc(sizeof(float) * (size_t)n * qd);
-    float *Kb  = malloc(sizeof(float) * (size_t)n * kv_dim);
-    float *Vb  = malloc(sizeof(float) * (size_t)n * kv_dim);
-    float *Ob  = malloc(sizeof(float) * (size_t)n * qd);
-    float *H1  = malloc(sizeof(float) * (size_t)n * hidden);
-    float *H2  = malloc(sizeof(float) * (size_t)n * hidden);
-    BlockQ8_0 *xqb = malloc(sizeof(BlockQ8_0) * (size_t)n * (wide / EMBER_Q_BLOCK + 1));
+    float *X   = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill X");
+    float *Xn  = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill Xn");
+    float *Tmp = ember_xmalloc(sizeof(float) * (size_t)n * dim, "prefill Tmp");
+    float *Q   = ember_xmalloc(sizeof(float) * (size_t)n * qd, "prefill Q");
+    float *Kb  = ember_xmalloc(sizeof(float) * (size_t)n * kv_dim, "prefill K");
+    float *Vb  = ember_xmalloc(sizeof(float) * (size_t)n * kv_dim, "prefill V");
+    float *Ob  = ember_xmalloc(sizeof(float) * (size_t)n * qd, "prefill O");
+    float *H1  = ember_xmalloc(sizeof(float) * (size_t)n * hidden, "prefill H1");
+    float *H2  = ember_xmalloc(sizeof(float) * (size_t)n * hidden, "prefill H2");
+    BlockQ8_0 *xqb = ember_xmalloc(sizeof(BlockQ8_0) * (size_t)n * (wide / EMBER_Q_BLOCK + 1), "prefill quant scratch");
 
-    for (int b = 0; b < n; b++) embed_row(&s->tok_emb, ids[b], dim, X + (size_t)b * dim);
+    for (int b = 0; b < n; b++) {
+        if (ids[b] < 0 || ids[b] >= s->vocab)
+            ember_die("token id %d out of range [0,%d)", ids[b], s->vocab);
+        embed_row(&s->tok_emb, ids[b], dim, X + (size_t)b * dim);
+    }
 
     for (int l = 0; l < s->n_layers; l++) {
         for (int b = 0; b < n; b++)
@@ -243,6 +315,10 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
         ember_matmul_batch(Q,  Xn, s->wq[l].data, s->wq[l].dtype, dim, qd,     n, xqb);
         ember_matmul_batch(Kb, Xn, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, n, xqb);
         ember_matmul_batch(Vb, Xn, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, n, xqb);
+
+        if (s->b_q[l]) for (int b = 0; b < n; b++) for (int i = 0; i < qd; i++)     Q[(size_t)b*qd+i]     += s->b_q[l][i];
+        if (s->b_k[l]) for (int b = 0; b < n; b++) for (int i = 0; i < kv_dim; i++) Kb[(size_t)b*kv_dim+i] += s->b_k[l][i];
+        if (s->b_v[l]) for (int b = 0; b < n; b++) for (int i = 0; i < kv_dim; i++) Vb[(size_t)b*kv_dim+i] += s->b_v[l][i];
 
         for (int b = 0; b < n; b++) {
             int pos = start + b;
@@ -253,9 +329,7 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
             }
             rope(qb, qd, hd, pos, s->rope_theta, s->rope_style);
             rope(kb, kv_dim, hd, pos, s->rope_theta, s->rope_style);
-            memcpy(s->key_cache + ((size_t)l * s->ctx + pos) * kv_dim, kb, sizeof(float) * kv_dim);
-            memcpy(s->value_cache + ((size_t)l * s->ctx + pos) * kv_dim,
-                   Vb + (size_t)b * kv_dim, sizeof(float) * kv_dim);
+            kv_store(s, l, pos, kb, Vb + (size_t)b * kv_dim);
         }
 
         for (int b = 0; b < n; b++)
@@ -291,16 +365,23 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
     int kv_dim = s->kv_dim, kv_mul = nh / nkv;
     float eps = s->norm_eps;
 
+    if (tok < 0 || tok >= s->vocab)
+        ember_die("token id %d out of range [0,%d)", tok, s->vocab);
+    if (pos < 0 || pos >= s->ctx)
+        ember_die("position %d out of range [0,%d)", pos, s->ctx);
     embed_row(&s->tok_emb, tok, dim, s->x);
 
     for (int l = 0; l < s->n_layers; l++) {
         rmsnorm(s->xb, s->x, s->attn_norm[l], dim, eps);
 
-        float *k = s->key_cache + ((size_t)l * s->ctx + pos) * kv_dim;
-        float *v = s->value_cache + ((size_t)l * s->ctx + pos) * kv_dim;
+        float *k = s->kbuf, *v = s->vbuf; /* fp32 scratch; kv_store writes the cache */
         ember_matmul(s->q, s->xb, s->wq[l].data, s->wq[l].dtype, dim, nh * hd, s->xq);
         ember_matmul(k,    s->xb, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, s->xq);
         ember_matmul(v,    s->xb, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, s->xq);
+
+        if (s->b_q[l]) for (int i = 0; i < nh * hd; i++) s->q[i] += s->b_q[l][i];
+        if (s->b_k[l]) for (int i = 0; i < kv_dim; i++)  k[i]    += s->b_k[l][i];
+        if (s->b_v[l]) for (int i = 0; i < kv_dim; i++)  v[i]    += s->b_v[l][i];
 
         if (s->qk_norm && s->q_norm[l]) {
             for (int h = 0; h < nh; h++)  rmsnorm(s->q + h * hd, s->q + h * hd, s->q_norm[l], hd, eps);
@@ -309,6 +390,7 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
 
         rope(s->q, nh * hd, hd, pos, s->rope_theta, s->rope_style);
         rope(k, kv_dim, hd, pos, s->rope_theta, s->rope_style);
+        kv_store(s, l, pos, k, v);
 
         attention(s, s->q, s->xb, l, pos, nh, hd, kv_dim, kv_mul);
 
