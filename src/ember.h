@@ -121,6 +121,8 @@ void        ember_state_free(EmberState *s);
 /* Run one forward pass for token `tok` at position `pos`; returns logits
  * (length vocab_size), owned by the state. */
 float      *ember_forward(EmberModel *m, EmberState *s, int tok, int pos);
+/* Batched prefill of ids[0..n) at positions start.., returns last-token logits. */
+float      *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int start);
 
 /* tokenizer.c */
 EmberTokenizer *ember_tokenizer_new(const EmberModel *m);

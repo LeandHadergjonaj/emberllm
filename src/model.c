@@ -154,6 +154,100 @@ void ember_state_free(EmberState *s) {
     free(s);
 }
 
+/* Batched prefill: process ids[0..n) at positions start..start+n-1, filling the
+ * KV cache, and return logits for the LAST token only. Streams each weight row
+ * once for all n tokens (GEMM), which is far faster than n single-token passes. */
+float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int start) {
+    (void)m;
+    if (n <= 0) return s->logits;
+    int dim = s->dim, hd = s->head_dim, nh = s->n_heads, nkv = s->n_kv;
+    int kv_dim = s->kv_dim, kv_mul = nh / nkv, hidden = s->hidden;
+    float eps = s->norm_eps;
+    int qd = nh * hd;
+
+    int wide = dim; if (hidden > wide) wide = hidden; if (qd > wide) wide = qd;
+    float *X   = malloc(sizeof(float) * (size_t)n * dim);
+    float *Xn  = malloc(sizeof(float) * (size_t)n * dim);
+    float *Tmp = malloc(sizeof(float) * (size_t)n * dim);
+    float *Q   = malloc(sizeof(float) * (size_t)n * qd);
+    float *Kb  = malloc(sizeof(float) * (size_t)n * kv_dim);
+    float *Vb  = malloc(sizeof(float) * (size_t)n * kv_dim);
+    float *Ob  = malloc(sizeof(float) * (size_t)n * qd);
+    float *H1  = malloc(sizeof(float) * (size_t)n * hidden);
+    float *H2  = malloc(sizeof(float) * (size_t)n * hidden);
+    BlockQ8_0 *xqb = malloc(sizeof(BlockQ8_0) * (size_t)n * (wide / EMBER_Q_BLOCK + 1));
+
+    for (int b = 0; b < n; b++) embed_row(&s->tok_emb, ids[b], dim, X + (size_t)b * dim);
+
+    for (int l = 0; l < s->n_layers; l++) {
+        for (int b = 0; b < n; b++)
+            rmsnorm(Xn + (size_t)b * dim, X + (size_t)b * dim, s->attn_norm[l], dim, eps);
+
+        ember_matmul_batch(Q,  Xn, s->wq[l].data, s->wq[l].dtype, dim, qd,     n, xqb);
+        ember_matmul_batch(Kb, Xn, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, n, xqb);
+        ember_matmul_batch(Vb, Xn, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, n, xqb);
+
+        for (int b = 0; b < n; b++) {
+            int pos = start + b;
+            float *qb = Q + (size_t)b * qd, *kb = Kb + (size_t)b * kv_dim;
+            if (s->qk_norm && s->q_norm[l]) {
+                for (int h = 0; h < nh; h++)  rmsnorm(qb + h * hd, qb + h * hd, s->q_norm[l], hd, eps);
+                for (int h = 0; h < nkv; h++) rmsnorm(kb + h * hd, kb + h * hd, s->k_norm[l], hd, eps);
+            }
+            rope(qb, qd, hd, pos, s->rope_theta, s->rope_style);
+            rope(kb, kv_dim, hd, pos, s->rope_theta, s->rope_style);
+            memcpy(s->key_cache + ((size_t)l * s->ctx + pos) * kv_dim, kb, sizeof(float) * kv_dim);
+            memcpy(s->value_cache + ((size_t)l * s->ctx + pos) * kv_dim,
+                   Vb + (size_t)b * kv_dim, sizeof(float) * kv_dim);
+        }
+
+        float inv_sqrt = 1.0f / sqrtf((float)hd);
+        for (int b = 0; b < n; b++) {
+            int pos = start + b;
+            for (int h = 0; h < nh; h++) {
+                const float *qh = Q + (size_t)b * qd + h * hd;
+                float *att = s->att + h * s->ctx;
+                int kvh = h / kv_mul;
+                for (int t = 0; t <= pos; t++) {
+                    const float *kt = s->key_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
+                    float sc = 0.0f;
+                    for (int i = 0; i < hd; i++) sc += qh[i] * kt[i];
+                    att[t] = sc * inv_sqrt;
+                }
+                softmax(att, pos + 1);
+                float *out = Ob + (size_t)b * qd + h * hd;
+                for (int i = 0; i < hd; i++) out[i] = 0.0f;
+                for (int t = 0; t <= pos; t++) {
+                    const float *vt = s->value_cache + ((size_t)l * s->ctx + t) * kv_dim + kvh * hd;
+                    float a = att[t];
+                    for (int i = 0; i < hd; i++) out[i] += a * vt[i];
+                }
+            }
+        }
+
+        ember_matmul_batch(Tmp, Ob, s->wo[l].data, s->wo[l].dtype, qd, dim, n, xqb);
+        for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += Tmp[i];
+
+        for (int b = 0; b < n; b++)
+            rmsnorm(Xn + (size_t)b * dim, X + (size_t)b * dim, s->ffn_norm[l], dim, eps);
+        ember_matmul_batch(H1, Xn, s->w1[l].data, s->w1[l].dtype, dim, hidden, n, xqb);
+        ember_matmul_batch(H2, Xn, s->w3[l].data, s->w3[l].dtype, dim, hidden, n, xqb);
+        for (size_t i = 0; i < (size_t)n * hidden; i++) {
+            float g = H1[i];
+            H1[i] = g / (1.0f + expf(-g)) * H2[i];
+        }
+        ember_matmul_batch(Tmp, H1, s->w2[l].data, s->w2[l].dtype, hidden, dim, n, xqb);
+        for (size_t i = 0; i < (size_t)n * dim; i++) X[i] += Tmp[i];
+    }
+
+    /* only the last token's logits are needed to continue generation */
+    rmsnorm(s->x, X + (size_t)(n - 1) * dim, s->final_norm, dim, eps);
+    ember_matmul(s->logits, s->x, s->lm_head.data, s->lm_head.dtype, dim, s->vocab, s->xq);
+
+    free(X); free(Xn); free(Tmp); free(Q); free(Kb); free(Vb); free(Ob); free(H1); free(H2); free(xqb);
+    return s->logits;
+}
+
 float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
     (void)m;
     int dim = s->dim, hd = s->head_dim, nh = s->n_heads, nkv = s->n_kv;

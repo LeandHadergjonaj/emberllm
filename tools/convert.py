@@ -16,6 +16,7 @@ Usage:
         --out        models/stories15M.ember
 """
 import argparse
+import json
 import struct
 import sys
 
@@ -188,6 +189,123 @@ def convert_llama2c(checkpoint, tokenizer, out):
     write_ember(out, cfg, TOK_LLAMA_SP, tok_blob, tensors)
 
 
+# --- Qwen3 / safetensors reader (needs numpy + safetensors's format, not torch) ---
+
+def _read_safetensors(path):
+    """Return {name: (dtype_str, shape, numpy_fp32_array)} parsing bf16 by hand."""
+    import numpy as np
+    with open(path, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(hlen))
+        data_start = 8 + hlen
+        out = {}
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            dtype, shape = meta["dtype"], meta["shape"]
+            a, b = meta["data_offsets"]
+            f.seek(data_start + a)
+            raw = f.read(b - a)
+            if dtype == "BF16":
+                u16 = np.frombuffer(raw, dtype=np.uint16)
+                arr = (u16.astype(np.uint32) << 16).view(np.float32)
+            elif dtype in ("F32", "F16"):
+                arr = np.frombuffer(raw, dtype=np.float16 if dtype == "F16" else np.float32).astype(np.float32)
+            else:
+                raise ValueError(f"unsupported dtype {dtype} for {name}")
+            out[name] = arr.reshape(shape) if shape else arr
+    return out
+
+
+def _byte_level_maps():
+    """GPT-2 byte<->unicode bijection; returns byte->unicode-codepoint list."""
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) \
+        + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b); cs.append(256 + n); n += 1
+    return {b: chr(c) for b, c in zip(bs, cs)}
+
+
+def _build_bpe_blob(tokenizer_json, vocab_size):
+    """Pack vocab + merges + specials into the EMBER_TOK_BYTE_BPE blob."""
+    tj = json.load(open(tokenizer_json))
+    vocab = tj["model"]["vocab"]            # token_string -> id (byte-level encoded)
+    merges = tj["model"]["merges"]          # list of [a, b]
+    specials = {a["content"]: a["id"] for a in tj.get("added_tokens", [])}
+
+    id_to_str = [b""] * vocab_size
+    is_special = [0] * vocab_size
+    for s, i in vocab.items():
+        if 0 <= i < vocab_size:
+            id_to_str[i] = s.encode("utf-8")
+    for content, i in specials.items():
+        if 0 <= i < vocab_size:
+            id_to_str[i] = content.encode("utf-8")
+            is_special[i] = 1
+
+    out = bytearray()
+    out += struct.pack("<III", vocab_size, len(merges), len(specials))
+    for i in range(vocab_size):
+        out += struct.pack("<BI", is_special[i], len(id_to_str[i])) + id_to_str[i]
+    for a, b in merges:
+        ab, bb = a.encode("utf-8"), b.encode("utf-8")
+        out += struct.pack("<I", len(ab)) + ab + struct.pack("<I", len(bb)) + bb
+    for content, i in specials.items():
+        cb = content.encode("utf-8")
+        out += struct.pack("<II", i, len(cb)) + cb
+    return bytes(out)
+
+
+def convert_qwen(model_dir, out):
+    import numpy as np
+    cfg_j = json.load(open(f"{model_dir}/config.json"))
+    st = _read_safetensors(f"{model_dir}/model.safetensors")
+    dim = cfg_j["hidden_size"]; hidden = cfg_j["intermediate_size"]
+    n_layers = cfg_j["num_hidden_layers"]; n_heads = cfg_j["num_attention_heads"]
+    n_kv = cfg_j["num_key_value_heads"]; head_dim = cfg_j["head_dim"]
+    vocab = cfg_j["vocab_size"]
+    tied = cfg_j.get("tie_word_embeddings", False)
+
+    tensors = [TensorSpec("tok_embeddings", DT_F32, [vocab, dim],
+                          st["model.embed_tokens.weight"].astype(np.float32).tobytes())]
+    for l in range(n_layers):
+        p = f"model.layers.{l}"
+        def add(name, key, shape):
+            tensors.append(TensorSpec(name, DT_F32, shape, st[key].astype(np.float32).tobytes()))
+        add(f"layers.{l}.attn_norm", f"{p}.input_layernorm.weight", [dim])
+        add(f"layers.{l}.wq", f"{p}.self_attn.q_proj.weight", [n_heads * head_dim, dim])
+        add(f"layers.{l}.wk", f"{p}.self_attn.k_proj.weight", [n_kv * head_dim, dim])
+        add(f"layers.{l}.wv", f"{p}.self_attn.v_proj.weight", [n_kv * head_dim, dim])
+        add(f"layers.{l}.wo", f"{p}.self_attn.o_proj.weight", [dim, n_heads * head_dim])
+        add(f"layers.{l}.q_norm", f"{p}.self_attn.q_norm.weight", [head_dim])
+        add(f"layers.{l}.k_norm", f"{p}.self_attn.k_norm.weight", [head_dim])
+        add(f"layers.{l}.ffn_norm", f"{p}.post_attention_layernorm.weight", [dim])
+        add(f"layers.{l}.w1", f"{p}.mlp.gate_proj.weight", [hidden, dim])
+        add(f"layers.{l}.w2", f"{p}.mlp.down_proj.weight", [dim, hidden])
+        add(f"layers.{l}.w3", f"{p}.mlp.up_proj.weight", [hidden, dim])
+    tensors.append(TensorSpec("final_norm", DT_F32, [dim], st["model.norm.weight"].astype(np.float32).tobytes()))
+    if not tied:
+        tensors.append(TensorSpec("lm_head", DT_F32, [vocab, dim],
+                                  st["lm_head.weight"].astype(np.float32).tobytes()))
+
+    blob = _build_bpe_blob(f"{model_dir}/tokenizer.json", vocab)
+    cfg = dict(
+        dim=dim, hidden_dim=hidden, n_layers=n_layers, n_heads=n_heads,
+        n_kv_heads=n_kv, head_dim=head_dim, vocab_size=vocab,
+        max_seq_len=cfg_j["max_position_embeddings"],
+        rope_theta=float(cfg_j["rope_theta"]), norm_eps=float(cfg_j["rms_norm_eps"]),
+        flags=(FLAG_TIED_EMBED if tied else 0) | FLAG_QK_NORM,
+        rope_style=ROPE_NEOX,
+        bos_token_id=cfg_j.get("bos_token_id", -1) if cfg_j.get("bos_token_id") is not None else -1,
+        eos_token_id=cfg_j["eos_token_id"], eos_token_id2=151645,  # <|im_end|>
+        default_top_k=20, default_temp=0.6, default_top_p=0.95,
+    )
+    write_ember(out, cfg, TOK_BYTE_BPE, blob, tensors)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -195,9 +313,14 @@ def main():
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--tokenizer", required=True)
     p.add_argument("--out", required=True)
+    q = sub.add_parser("qwen", help="convert a Qwen3 HF safetensors dir")
+    q.add_argument("--model-dir", required=True)
+    q.add_argument("--out", required=True)
     args = ap.parse_args()
     if args.cmd == "llama2c":
         convert_llama2c(args.checkpoint, args.tokenizer, args.out)
+    elif args.cmd == "qwen":
+        convert_qwen(args.model_dir, args.out)
 
 
 if __name__ == "__main__":

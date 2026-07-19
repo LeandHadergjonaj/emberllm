@@ -232,3 +232,47 @@ void ember_matmul(float *out, const float *x, const void *w, int dtype,
     else
         mm_rows(&c, 0, d_out);
 }
+
+/* ---- batched matmul (prefill) ---- */
+typedef struct {
+    float *out; const void *x; const void *w; int n_in, d_out, dtype, B;
+} MMBatch;
+
+static void mmb_rows(void *c, int i0, int i1) {
+    MMBatch *m = c;
+    int nb = m->n_in / EMBER_Q_BLOCK, d_out = m->d_out, B = m->B;
+    for (int i = i0; i < i1; i++) {
+        if (m->dtype == EMBER_DT_F32) {
+            const float *wrow = (const float *)m->w + (size_t)i * m->n_in;
+            const float *x = m->x;
+            for (int b = 0; b < B; b++)
+                m->out[(size_t)b * d_out + i] = dot_f32(wrow, x + (size_t)b * m->n_in, m->n_in);
+        } else if (m->dtype == EMBER_DT_Q8_0) {
+            const BlockQ8_0 *wrow = (const BlockQ8_0 *)m->w + (size_t)i * nb;
+            const BlockQ8_0 *xq = m->x;
+            for (int b = 0; b < B; b++)
+                m->out[(size_t)b * d_out + i] = vecdot_q8(wrow, xq + (size_t)b * nb, nb);
+        } else {
+            const BlockQ4_0 *wrow = (const BlockQ4_0 *)m->w + (size_t)i * nb;
+            const BlockQ8_0 *xq = m->x;
+            for (int b = 0; b < B; b++)
+                m->out[(size_t)b * d_out + i] = vecdot_q4(wrow, xq + (size_t)b * nb, nb);
+        }
+    }
+}
+
+void ember_matmul_batch(float *out, const float *x, const void *w, int dtype,
+                        int n_in, int d_out, int B, BlockQ8_0 *xq) {
+    const void *xin = x;
+    if (dtype != EMBER_DT_F32) {
+        int nb = n_in / EMBER_Q_BLOCK;
+        for (int b = 0; b < B; b++)
+            ember_quantize_q8_0(x + (size_t)b * n_in, xq + (size_t)b * nb, n_in);
+        xin = xq;
+    }
+    MMBatch c = { out, xin, w, n_in, d_out, dtype, B };
+    if (ember_nthreads() > 1 && (long)n_in * d_out * B >= (1 << 15))
+        ember_parallel_for(mmb_rows, &c, d_out);
+    else
+        mmb_rows(&c, 0, d_out);
+}

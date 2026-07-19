@@ -30,6 +30,13 @@ void ember_quantize_q4_0(const float *x, BlockQ4_0 *out, int n);
 void ember_matmul(float *out, const float *x, const void *w, int dtype,
                   int n_in, int d_out, BlockQ8_0 *xq);
 
+/* Batched matmul for prefill: out[B][d_out] = x[B][n_in] * W[d_out,n_in]^T.
+ * Loops output rows outermost so each weight row is streamed once for all B
+ * tokens — the bandwidth win over calling ember_matmul B times. `xq` is scratch
+ * of B*(n_in/32) BlockQ8_0 for the quantized paths. */
+void ember_matmul_batch(float *out, const float *x, const void *w, int dtype,
+                        int n_in, int d_out, int B, BlockQ8_0 *xq);
+
 /* --- thread pool --------------------------------------------------------- */
 typedef void (*EmberRangeFn)(void *ctx, int i0, int i1);
 void ember_threads_init(int nthreads);   /* nthreads<=1 disables the pool */
