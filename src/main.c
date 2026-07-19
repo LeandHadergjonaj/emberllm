@@ -46,9 +46,10 @@ static int cmd_info(const char *path) {
     printf("  vocab %d  max_seq_len %d\n", h->vocab_size, h->max_seq_len);
     printf("  rope_theta %g (%s)  norm_eps %g\n", h->rope_theta,
            h->rope_style == EMBER_ROPE_NEOX ? "neox" : "interleaved", h->norm_eps);
-    printf("  flags %s%s\n",
+    printf("  flags %s%s%s\n",
            (h->flags & EMBER_FLAG_TIED_EMBED) ? "tied_embed " : "",
-           (h->flags & EMBER_FLAG_QK_NORM) ? "qk_norm " : "");
+           (h->flags & EMBER_FLAG_QK_NORM) ? "qk_norm " : "",
+           (h->flags & EMBER_FLAG_THINKING) ? "thinking " : "");
     printf("  tokenizer %s (%llu B)  bos/eos %d/%d%s\n",
            h->tokenizer_type == EMBER_TOK_BYTE_BPE ? "byte_bpe" : "llama_sp",
            (unsigned long long)h->tokenizer_size, h->bos_token_id, h->eos_token_id,
@@ -376,10 +377,13 @@ static int cmd_chat(int argc, char **argv) {
         if (L && buf[L - 1] == '\n') buf[--L] = '\0';
         if (L == 0) continue;
 
+        /* Qwen3's <think> block is only injected to *suppress* its reasoning
+         * mode; models without that mode must not see these literal tokens. */
+        int no_think = (h->flags & EMBER_FLAG_THINKING) && !think;
         char turn[8300];
         snprintf(turn, sizeof(turn),
                  "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n%s",
-                 buf, think ? "" : "<think>\n\n</think>\n\n");
+                 buf, no_think ? "<think>\n\n</think>\n\n" : "");
         float *logits = feed(m, st, tok, turn, &pos, ctx);
 
         int prev = 0;

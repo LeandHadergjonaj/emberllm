@@ -183,8 +183,10 @@ typedef struct {
     int              ctx;
 } Server;
 
-/* Build the ChatML prompt from an OpenAI "messages" array. */
-static void build_prompt(const JsonValue *messages, int think, Buf *out) {
+/* Build the ChatML prompt from an OpenAI "messages" array. `inject_no_think`
+ * appends Qwen3's empty <think> block to suppress its reasoning mode; it must
+ * be false for models without that mode (they'd see the tokens as literal text). */
+static void build_prompt(const JsonValue *messages, int inject_no_think, Buf *out) {
     for (int i = 0; i < messages->n_items; i++) {
         const JsonValue *msg = messages->items[i];
         const char *role = json_str(json_get(msg, "role"), "user");
@@ -196,7 +198,7 @@ static void build_prompt(const JsonValue *messages, int think, Buf *out) {
         buf_puts(out, "<|im_end|>\n");
     }
     buf_puts(out, "<|im_start|>assistant\n");
-    if (!think) buf_puts(out, "<think>\n\n</think>\n\n");
+    if (inject_no_think) buf_puts(out, "<think>\n\n</think>\n\n");
 }
 
 /* Collect stop strings from the request's "stop" field (string or array). */
@@ -252,9 +254,10 @@ static void handle_chat(Server *sv, int fd, const char *body, size_t body_len) {
     float pres_pen  = (float)json_num(json_get(req, "presence_penalty"), 0.0);
     StopList stops  = collect_stops(json_get(req, "stop"));
     int   think     = cfg->think && json_bool(json_get(req, "think"), 1);
+    int   no_think  = (sv->h->flags & EMBER_FLAG_THINKING) && !think;
 
     Buf prompt = {0};
-    build_prompt(messages, think, &prompt);
+    build_prompt(messages, no_think, &prompt);
 
     int *ids, n_prompt = ember_encode(sv->tok, prompt.data, 0, &ids);
     buf_free(&prompt);

@@ -178,12 +178,25 @@ src/server.c      hand-rolled OpenAI-compatible HTTP/1.1 server (SSE streaming)
 src/json.c        tiny dependency-free JSON reader (for request bodies)
 src/util.c        checked allocation + fatal-error helpers
 src/main.c        info | tokenize | generate | chat | serve | bench | perplexity | quantize
-tools/convert.py  llama2.c and Qwen3-safetensors -> .ember (numpy only, no torch)
+tools/convert.py  llama2.c + LLaMA-style HF safetensors -> .ember (numpy, no torch)
 ```
 
-Two model families run through one code path, distinguished only by fields in
-the file header: TinyStories (LLaMA-2 style, SentencePiece, interleaved RoPE)
-and Qwen3 (GQA, QK-RMSNorm, decoupled head_dim, byte-level BPE, NEOX RoPE).
+Several model families run through **one forward pass**, distinguished only by
+fields in the file header and the presence of optional tensors — the converter
+detects each variant from `config.json` rather than hard-coding it:
+
+| Model | licence | `download.sh` name | arch notes | verified |
+|---|---|---|---|:-:|
+| TinyStories 15M/42M/110M | MIT | `stories15M` … | LLaMA-2, SentencePiece, interleaved RoPE | ✅ |
+| Qwen3 0.6B / 1.7B | Apache-2.0 | `qwen3-0.6b` `qwen3-1.7b` | GQA, QK-norm, decoupled head_dim, `<think>` | ✅ |
+| Qwen2.5 0.5B / 1.5B | Apache-2.0 | `qwen2.5-0.5b` `qwen2.5-1.5b` | GQA, **QKV bias**, byte-BPE | ✅ |
+| SmolLM2 135M / 360M / 1.7B | Apache-2.0 | `smollm2-135m` … | LLaMA, GQA, tied embed, byte-BPE | ✅ |
+
+"Verified" = converts and generates coherent text on this engine; the
+TinyStories path is additionally checked token-for-token against `run.c`. Adding
+a new LLaMA-style model is usually just a `download.sh` line — the converter
+handles GQA, QK-norm, QKV bias, tied embeddings, and decoupled `head_dim`
+automatically.
 
 ## Correctness
 
@@ -209,8 +222,8 @@ references, not just eyeballed:
   its memory for long contexts.
 - **The pre-tokenizer regex is approximated** (C has no `\p{L}`). It's fuzz-clean
   on realistic English/code/Unicode but may differ from HF on pathological input.
-- Scope is single-stream inference of models up to ~1B parameters. No training,
-  batching across requests, speculative decoding, or GGUF import.
+- Scope is single-stream inference of LLaMA-family models up to ~2B parameters.
+  No training, batching across requests, speculative decoding, or GGUF import.
 - Malformed models and bad inputs fail with a clear `ember: ...` message rather
   than a crash, but the loader trusts a well-formed header's internal offsets
   once the top-level bounds check passes.

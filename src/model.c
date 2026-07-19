@@ -25,6 +25,7 @@ struct EmberState {
     Wt *wq, *wk, *wv, *wo, *w1, *w2, *w3;
     const float *final_norm;
     const float **attn_norm, **ffn_norm, **q_norm, **k_norm;
+    const float **b_q, **b_k, **b_v; /* optional attention biases (Qwen2.5); NULL if absent */
 
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits;
     float *key_cache, *value_cache;
@@ -117,6 +118,9 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->ffn_norm = ember_xmalloc(sizeof(void *) * L, "ffn_norm");
     s->q_norm = ember_xmalloc(sizeof(void *) * L, "q_norm");
     s->k_norm = ember_xmalloc(sizeof(void *) * L, "k_norm");
+    s->b_q = ember_xmalloc(sizeof(void *) * L, "b_q");
+    s->b_k = ember_xmalloc(sizeof(void *) * L, "b_k");
+    s->b_v = ember_xmalloc(sizeof(void *) * L, "b_v");
     for (int l = 0; l < L; l++) {
         s->wq[l] = tref(m, "layers.%d.wq", l); s->wk[l] = tref(m, "layers.%d.wk", l);
         s->wv[l] = tref(m, "layers.%d.wv", l); s->wo[l] = tref(m, "layers.%d.wo", l);
@@ -126,6 +130,9 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
         s->ffn_norm[l]  = tref_f32(m, "layers.%d.ffn_norm", l);
         s->q_norm[l]    = tref_f32(m, "layers.%d.q_norm", l);
         s->k_norm[l]    = tref_f32(m, "layers.%d.k_norm", l);
+        s->b_q[l]       = tref_f32(m, "layers.%d.wq_bias", l); /* optional */
+        s->b_k[l]       = tref_f32(m, "layers.%d.wk_bias", l);
+        s->b_v[l]       = tref_f32(m, "layers.%d.wv_bias", l);
     }
     s->tok_emb = tref(m, "tok_embeddings", -1);
     s->final_norm = tref_f32(m, "final_norm", -1);
@@ -166,6 +173,7 @@ void ember_state_free(EmberState *s) {
     free(s->wq); free(s->wk); free(s->wv); free(s->wo);
     free(s->w1); free(s->w2); free(s->w3);
     free(s->attn_norm); free(s->ffn_norm); free(s->q_norm); free(s->k_norm);
+    free(s->b_q); free(s->b_k); free(s->b_v);
     free(s->x); free(s->xb); free(s->xb2); free(s->hb); free(s->hb2);
     free(s->q); free(s->att); free(s->logits);
     free(s->key_cache); free(s->value_cache); free(s->xq);
@@ -264,6 +272,10 @@ float *ember_prefill(EmberModel *m, EmberState *s, const int *ids, int n, int st
         ember_matmul_batch(Kb, Xn, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, n, xqb);
         ember_matmul_batch(Vb, Xn, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, n, xqb);
 
+        if (s->b_q[l]) for (int b = 0; b < n; b++) for (int i = 0; i < qd; i++)     Q[(size_t)b*qd+i]     += s->b_q[l][i];
+        if (s->b_k[l]) for (int b = 0; b < n; b++) for (int i = 0; i < kv_dim; i++) Kb[(size_t)b*kv_dim+i] += s->b_k[l][i];
+        if (s->b_v[l]) for (int b = 0; b < n; b++) for (int i = 0; i < kv_dim; i++) Vb[(size_t)b*kv_dim+i] += s->b_v[l][i];
+
         for (int b = 0; b < n; b++) {
             int pos = start + b;
             float *qb = Q + (size_t)b * qd, *kb = Kb + (size_t)b * kv_dim;
@@ -325,6 +337,10 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
         ember_matmul(s->q, s->xb, s->wq[l].data, s->wq[l].dtype, dim, nh * hd, s->xq);
         ember_matmul(k,    s->xb, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, s->xq);
         ember_matmul(v,    s->xb, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, s->xq);
+
+        if (s->b_q[l]) for (int i = 0; i < nh * hd; i++) s->q[i] += s->b_q[l][i];
+        if (s->b_k[l]) for (int i = 0; i < kv_dim; i++)  k[i]    += s->b_k[l][i];
+        if (s->b_v[l]) for (int i = 0; i < kv_dim; i++)  v[i]    += s->b_v[l][i];
 
         if (s->qk_norm && s->q_norm[l]) {
             for (int h = 0; h < nh; h++)  rmsnorm(s->q + h * hd, s->q + h * hd, s->q_norm[l], hd, eps);

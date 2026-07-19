@@ -32,7 +32,8 @@ enum {
 /* header flag bits */
 enum {
     EMBER_FLAG_TIED_EMBED = 1u << 0, /* lm_head shares the token-embedding matrix   */
-    EMBER_FLAG_QK_NORM    = 1u << 1  /* per-head RMSNorm on Q and K before RoPE      */
+    EMBER_FLAG_QK_NORM    = 1u << 1, /* per-head RMSNorm on Q and K before RoPE      */
+    EMBER_FLAG_THINKING   = 1u << 2  /* model has a <think> reasoning mode (Qwen3)   */
 };
 
 /* rope_style */
