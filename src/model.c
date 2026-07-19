@@ -1,15 +1,18 @@
-/* model.c — fp32 forward pass for LLaMA-style decoder transformers.
+/* model.c — forward pass for LLaMA-style decoder transformers.
  *
- * Stage 1: correct but slow. Everything is scalar fp32; the matmul is a plain
- * row-wise dot product. Later stages replace `matmul` with threaded / NEON /
- * quantized kernels without touching the surrounding logic.
+ * The matmul, quantization, and threading live in kernels.c/threads.c; this
+ * file is the architecture: embedding, RMSNorm, RoPE, GQA attention, SwiGLU.
+ * Weights carry a dtype so the same code runs fp32, Q8_0, or Q4_0 models.
  */
 #include "ember.h"
+#include "kernels.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+typedef struct { const void *data; int dtype; } Wt; /* a weight + its encoding */
 
 struct EmberState {
     const EmberModel *m;
@@ -17,28 +20,16 @@ struct EmberState {
     float rope_theta, norm_eps;
     int   rope_style, qk_norm;
 
-    /* resolved weight pointers (into the mmap) */
-    const float  *tok_emb, *final_norm, *lm_head;
-    const float **attn_norm, **wq, **wk, **wv, **wo;
-    const float **ffn_norm, **w1, **w2, **w3;
-    const float **q_norm, **k_norm; /* per-head RMSNorm weights, Stage 3 */
+    Wt tok_emb, lm_head;
+    Wt *wq, *wk, *wv, *wo, *w1, *w2, *w3;
+    const float *final_norm;
+    const float **attn_norm, **ffn_norm, **q_norm, **k_norm;
 
-    /* activation scratch */
     float *x, *xb, *xb2, *hb, *hb2, *q, *att, *logits;
-    float *key_cache, *value_cache; /* [n_layers * ctx * kv_dim] */
+    float *key_cache, *value_cache;
+    BlockQ8_0 *xq; /* scratch: quantized activation for q8/q4 matmuls */
 };
 
-/* out[d_out] = W[d_out, n_in] * x[n_in], row-major weights. */
-static void matmul(float *out, const float *x, const float *w, int n_in, int d_out) {
-    for (int i = 0; i < d_out; i++) {
-        const float *row = w + (size_t)i * n_in;
-        float sum = 0.0f;
-        for (int j = 0; j < n_in; j++) sum += row[j] * x[j];
-        out[i] = sum;
-    }
-}
-
-/* RMSNorm with fp32 accumulation; epsilon inside the sqrt. */
 static void rmsnorm(float *out, const float *x, const float *weight, int n, float eps) {
     float ss = 0.0f;
     for (int i = 0; i < n; i++) ss += x[i] * x[i];
@@ -55,7 +46,6 @@ static void softmax(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
-/* Apply RoPE in-place to a vector of `n` values grouped into head_dim chunks. */
 static void rope(float *vec, int n, int head_dim, int pos, float theta, int style) {
     for (int h = 0; h < n; h += head_dim) {
         for (int i = 0; i < head_dim / 2; i++) {
@@ -72,12 +62,37 @@ static void rope(float *vec, int n, int head_dim, int pos, float theta, int styl
     }
 }
 
-static const float *tref(const EmberModel *m, const char *fmt, int l) {
+/* dequantize one Q8_0 row into fp32 (used for embedding lookup). */
+static void dequant_q8_row(const BlockQ8_0 *row, int n, float *out) {
+    int nb = n / EMBER_Q_BLOCK;
+    for (int b = 0; b < nb; b++) {
+        float d = ember_f16_to_f32(row[b].d);
+        for (int i = 0; i < EMBER_Q_BLOCK; i++)
+            out[b * EMBER_Q_BLOCK + i] = row[b].qs[i] * d;
+    }
+}
+
+static void embed_row(const Wt *w, int tok, int dim, float *out) {
+    if (w->dtype == EMBER_DT_F32) {
+        memcpy(out, (const float *)w->data + (size_t)tok * dim, sizeof(float) * dim);
+    } else { /* Q8_0 embedding table */
+        int nb = dim / EMBER_Q_BLOCK;
+        dequant_q8_row((const BlockQ8_0 *)w->data + (size_t)tok * nb, dim, out);
+    }
+}
+
+static Wt tref(const EmberModel *m, const char *fmt, int l) {
     char name[48];
     if (l >= 0) snprintf(name, sizeof(name), fmt, l);
     else        snprintf(name, sizeof(name), "%s", fmt);
     const EmberTensor *t = ember_model_tensor(m, name);
-    return t ? (const float *)ember_model_data(m, t) : NULL;
+    Wt w = { NULL, EMBER_DT_F32 };
+    if (t) { w.data = ember_model_data(m, t); w.dtype = t->dtype; }
+    return w;
+}
+
+static const float *tref_f32(const EmberModel *m, const char *fmt, int l) {
+    return (const float *)tref(m, fmt, l).data;
 }
 
 EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
@@ -92,27 +107,28 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->ctx = (ctx_len > 0 && ctx_len < h->max_seq_len) ? ctx_len : h->max_seq_len;
 
     int L = s->n_layers;
+    s->wq = malloc(sizeof(Wt) * L); s->wk = malloc(sizeof(Wt) * L);
+    s->wv = malloc(sizeof(Wt) * L); s->wo = malloc(sizeof(Wt) * L);
+    s->w1 = malloc(sizeof(Wt) * L); s->w2 = malloc(sizeof(Wt) * L);
+    s->w3 = malloc(sizeof(Wt) * L);
     s->attn_norm = malloc(sizeof(void *) * L); s->ffn_norm = malloc(sizeof(void *) * L);
-    s->wq = malloc(sizeof(void *) * L); s->wk = malloc(sizeof(void *) * L);
-    s->wv = malloc(sizeof(void *) * L); s->wo = malloc(sizeof(void *) * L);
-    s->w1 = malloc(sizeof(void *) * L); s->w2 = malloc(sizeof(void *) * L);
-    s->w3 = malloc(sizeof(void *) * L);
     s->q_norm = malloc(sizeof(void *) * L); s->k_norm = malloc(sizeof(void *) * L);
     for (int l = 0; l < L; l++) {
-        s->attn_norm[l] = tref(m, "layers.%d.attn_norm", l);
         s->wq[l] = tref(m, "layers.%d.wq", l); s->wk[l] = tref(m, "layers.%d.wk", l);
         s->wv[l] = tref(m, "layers.%d.wv", l); s->wo[l] = tref(m, "layers.%d.wo", l);
-        s->ffn_norm[l] = tref(m, "layers.%d.ffn_norm", l);
         s->w1[l] = tref(m, "layers.%d.w1", l); s->w2[l] = tref(m, "layers.%d.w2", l);
         s->w3[l] = tref(m, "layers.%d.w3", l);
-        s->q_norm[l] = tref(m, "layers.%d.q_norm", l);
-        s->k_norm[l] = tref(m, "layers.%d.k_norm", l);
+        s->attn_norm[l] = tref_f32(m, "layers.%d.attn_norm", l);
+        s->ffn_norm[l]  = tref_f32(m, "layers.%d.ffn_norm", l);
+        s->q_norm[l]    = tref_f32(m, "layers.%d.q_norm", l);
+        s->k_norm[l]    = tref_f32(m, "layers.%d.k_norm", l);
     }
     s->tok_emb = tref(m, "tok_embeddings", -1);
-    s->final_norm = tref(m, "final_norm", -1);
+    s->final_norm = tref_f32(m, "final_norm", -1);
     s->lm_head = (h->flags & EMBER_FLAG_TIED_EMBED) ? s->tok_emb : tref(m, "lm_head", -1);
 
     int hd = s->head_dim, nh = s->n_heads;
+    int wide = s->hidden > s->dim ? s->hidden : s->dim;
     s->x = malloc(sizeof(float) * s->dim);
     s->xb = malloc(sizeof(float) * s->dim);
     s->xb2 = malloc(sizeof(float) * s->dim);
@@ -123,17 +139,18 @@ EmberState *ember_state_new(const EmberModel *m, int ctx_len) {
     s->logits = malloc(sizeof(float) * s->vocab);
     s->key_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
     s->value_cache = malloc(sizeof(float) * (size_t)L * s->ctx * s->kv_dim);
+    s->xq = malloc(sizeof(BlockQ8_0) * (wide / EMBER_Q_BLOCK + 1));
     return s;
 }
 
 void ember_state_free(EmberState *s) {
     if (!s) return;
-    free(s->attn_norm); free(s->ffn_norm);
     free(s->wq); free(s->wk); free(s->wv); free(s->wo);
-    free(s->w1); free(s->w2); free(s->w3); free(s->q_norm); free(s->k_norm);
+    free(s->w1); free(s->w2); free(s->w3);
+    free(s->attn_norm); free(s->ffn_norm); free(s->q_norm); free(s->k_norm);
     free(s->x); free(s->xb); free(s->xb2); free(s->hb); free(s->hb2);
     free(s->q); free(s->att); free(s->logits);
-    free(s->key_cache); free(s->value_cache);
+    free(s->key_cache); free(s->value_cache); free(s->xq);
     free(s);
 }
 
@@ -143,18 +160,17 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
     int kv_dim = s->kv_dim, kv_mul = nh / nkv;
     float eps = s->norm_eps;
 
-    memcpy(s->x, s->tok_emb + (size_t)tok * dim, sizeof(float) * dim);
+    embed_row(&s->tok_emb, tok, dim, s->x);
 
     for (int l = 0; l < s->n_layers; l++) {
         rmsnorm(s->xb, s->x, s->attn_norm[l], dim, eps);
 
         float *k = s->key_cache + ((size_t)l * s->ctx + pos) * kv_dim;
         float *v = s->value_cache + ((size_t)l * s->ctx + pos) * kv_dim;
-        matmul(s->q, s->xb, s->wq[l], dim, nh * hd);
-        matmul(k, s->xb, s->wk[l], dim, kv_dim);
-        matmul(v, s->xb, s->wv[l], dim, kv_dim);
+        ember_matmul(s->q, s->xb, s->wq[l].data, s->wq[l].dtype, dim, nh * hd, s->xq);
+        ember_matmul(k,    s->xb, s->wk[l].data, s->wk[l].dtype, dim, kv_dim, s->xq);
+        ember_matmul(v,    s->xb, s->wv[l].data, s->wv[l].dtype, dim, kv_dim, s->xq);
 
-        /* optional per-head QK-RMSNorm before RoPE (Stage 3 models) */
         if (s->qk_norm && s->q_norm[l]) {
             for (int h = 0; h < nh; h++)  rmsnorm(s->q + h * hd, s->q + h * hd, s->q_norm[l], hd, eps);
             for (int h = 0; h < nkv; h++) rmsnorm(k + h * hd, k + h * hd, s->k_norm[l], hd, eps);
@@ -163,7 +179,6 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
         rope(s->q, nh * hd, hd, pos, s->rope_theta, s->rope_style);
         rope(k, kv_dim, hd, pos, s->rope_theta, s->rope_style);
 
-        /* multi-head attention over positions 0..pos */
         float inv_sqrt = 1.0f / sqrtf((float)hd);
         for (int h = 0; h < nh; h++) {
             const float *qh = s->q + h * hd;
@@ -185,22 +200,21 @@ float *ember_forward(EmberModel *m, EmberState *s, int tok, int pos) {
             }
         }
 
-        matmul(s->xb2, s->xb, s->wo[l], nh * hd, dim);
+        ember_matmul(s->xb2, s->xb, s->wo[l].data, s->wo[l].dtype, nh * hd, dim, s->xq);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
 
-        /* FFN: w2( silu(w1 x) * w3 x ) */
         rmsnorm(s->xb, s->x, s->ffn_norm[l], dim, eps);
-        matmul(s->hb, s->xb, s->w1[l], dim, s->hidden);
-        matmul(s->hb2, s->xb, s->w3[l], dim, s->hidden);
+        ember_matmul(s->hb,  s->xb, s->w1[l].data, s->w1[l].dtype, dim, s->hidden, s->xq);
+        ember_matmul(s->hb2, s->xb, s->w3[l].data, s->w3[l].dtype, dim, s->hidden, s->xq);
         for (int i = 0; i < s->hidden; i++) {
             float g = s->hb[i];
             s->hb[i] = g / (1.0f + expf(-g)) * s->hb2[i];
         }
-        matmul(s->xb, s->hb, s->w2[l], s->hidden, dim);
+        ember_matmul(s->xb, s->hb, s->w2[l].data, s->w2[l].dtype, s->hidden, dim, s->xq);
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
     }
 
     rmsnorm(s->x, s->x, s->final_norm, dim, eps);
-    matmul(s->logits, s->x, s->lm_head, dim, s->vocab);
+    ember_matmul(s->logits, s->x, s->lm_head.data, s->lm_head.dtype, dim, s->vocab, s->xq);
     return s->logits;
 }

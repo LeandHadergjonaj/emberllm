@@ -142,4 +142,7 @@ typedef struct {
 void ember_sampler_init(EmberSampler *s, float temp, float top_p, int top_k, uint64_t seed);
 int  ember_sample(EmberSampler *s, float *logits, int n);
 
+/* quant.c — offline requantization (target: EMBER_DT_Q8_0 or EMBER_DT_Q4_0) */
+int ember_quantize_file(const char *in_path, const char *out_path, int target);
+
 #endif /* EMBER_H */

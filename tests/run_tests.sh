@@ -42,6 +42,17 @@ while IFS= read -r line && IFS= read -r expect <&3; do
 done < "$GOLD/tokenize_cases.txt" 3< "$GOLD/tokenize_expected.txt"
 echo "  ($i cases)"
 
+echo "== test 3: Q8_0 quantize + generate round-trip =="
+if [ ! -x ./ember ]; then make >/dev/null; fi
+./ember quantize "$MODEL" models/_test_q8.ember q8_0 >/dev/null 2>&1
+q8out=$(./ember generate models/_test_q8.ember -p "Once upon a time" -n 24 -t 0 2>/dev/null)
+if printf '%s' "$q8out" | grep -q "Once upon a time"; then
+    echo "  ok: Q8_0 model builds and generates coherent text"
+else
+    echo "  FAIL: Q8_0 generation empty or malformed"; echo "    got: $q8out"; fail=1
+fi
+rm -f models/_test_q8.ember
+
 echo "== test 2: greedy transcript =="
 if [ "${EMBER_SKIP_TRANSCRIPT:-0}" = "1" ]; then
     echo "  skip: not the reference platform (fp reductions are not bit-portable)"

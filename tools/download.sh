@@ -28,6 +28,13 @@ case "$MODEL" in
             --checkpoint "models/${MODEL}.bin" \
             --tokenizer  "models/tokenizer.bin" \
             --out        "models/${MODEL}.ember"
+        # also produce a Q8_0 build (needs the engine binary)
+        if [ -x ./ember ]; then
+            ./ember quantize "models/${MODEL}.ember" "models/${MODEL}-q8.ember" q8_0
+        else
+            echo "note: build the engine ('make') then run"
+            echo "      ./ember quantize models/${MODEL}.ember models/${MODEL}-q8.ember q8_0"
+        fi
         echo "ready: models/${MODEL}.ember"
         ;;
     *)

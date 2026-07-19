@@ -11,9 +11,10 @@ CSTD     = -std=c11
 WARN     = -Wall -Wextra
 SRC      = $(wildcard src/*.c)
 LDLIBS   = -lm
+PTHREAD  = -pthread
 
-# Optimized: let the compiler use the host's SIMD. Threads arrive in Stage 2.
-CFLAGS  ?= $(CSTD) $(WARN) -O3 -ffast-math -march=native -funroll-loops
+# Optimized: let the compiler use the host's SIMD (NEON on ARM, AVX2 on x86).
+CFLAGS  ?= $(CSTD) $(WARN) -O3 -ffast-math -march=native -funroll-loops $(PTHREAD)
 
 BIN      = ember
 
@@ -24,14 +25,14 @@ all: $(BIN)
 $(BIN): $(SRC) src/ember.h
 	$(CC) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
-# Deliberately un-optimized: the slow "before" side of the race demo.
+# Deliberately un-optimized and single-threaded: the "before" side of the race.
 baseline: $(SRC) src/ember.h
-	$(CC) $(CSTD) $(WARN) -O0 -o $(BIN)-baseline $(SRC) $(LDLIBS)
+	$(CC) $(CSTD) $(WARN) -O0 $(PTHREAD) -o $(BIN)-baseline $(SRC) $(LDLIBS)
 
 # Deterministic build used by the transcript test: no FMA/fast-math reordering.
 debug: $(SRC) src/ember.h
 	$(CC) $(CSTD) $(WARN) -Werror -O2 -fno-fast-math -ffp-contract=off \
-		-g -o $(BIN)-debug $(SRC) $(LDLIBS)
+		$(PTHREAD) -g -o $(BIN)-debug $(SRC) $(LDLIBS)
 
 test: debug
 	./tests/run_tests.sh
