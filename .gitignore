@@ -24,3 +24,6 @@ __pycache__/
 # sanitizer builds
 /ember-asan
 /ember-tsan
+
+# stray nested clone (from README quickstart run inside the repo)
+/emberllm/
