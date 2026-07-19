@@ -8,13 +8,17 @@
 
 CC      ?= cc
 CSTD     = -std=c11
+# -std=c11 is strict ISO C; glibc then hides POSIX/BSD symbols we use
+# (clock_gettime, madvise/MADV_WILLNEED, getrusage/RUSAGE_SELF). _DEFAULT_SOURCE
+# re-exposes them. macOS headers expose these regardless, so this is a no-op there.
+DEFS     = -D_DEFAULT_SOURCE
 WARN     = -Wall -Wextra
 SRC      = $(wildcard src/*.c)
 LDLIBS   = -lm
 PTHREAD  = -pthread
 
 # Optimized: let the compiler use the host's SIMD (NEON on ARM, AVX2 on x86).
-CFLAGS  ?= $(CSTD) $(WARN) -O3 -ffast-math -march=native -funroll-loops $(PTHREAD)
+CFLAGS  ?= $(CSTD) $(DEFS) $(WARN) -O3 -ffast-math -march=native -funroll-loops $(PTHREAD)
 
 BIN      = ember
 
@@ -27,11 +31,11 @@ $(BIN): $(SRC) src/ember.h
 
 # Deliberately un-optimized and single-threaded: the "before" side of the race.
 baseline: $(SRC) src/ember.h
-	$(CC) $(CSTD) $(WARN) -O0 $(PTHREAD) -o $(BIN)-baseline $(SRC) $(LDLIBS)
+	$(CC) $(CSTD) $(DEFS) $(WARN) -O0 $(PTHREAD) -o $(BIN)-baseline $(SRC) $(LDLIBS)
 
 # Deterministic build used by the transcript test: no FMA/fast-math reordering.
 debug: $(SRC) src/ember.h
-	$(CC) $(CSTD) $(WARN) -Werror -O2 -fno-fast-math -ffp-contract=off \
+	$(CC) $(CSTD) $(DEFS) $(WARN) -Werror -O2 -fno-fast-math -ffp-contract=off \
 		$(PTHREAD) -g -o $(BIN)-debug $(SRC) $(LDLIBS)
 
 test: debug
