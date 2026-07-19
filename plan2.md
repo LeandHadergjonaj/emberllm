@@ -14,6 +14,24 @@ llama.cpp?"*. We are not trying to become llama.cpp; we are trying to be the sma
 readable engine that a person can actually **run their model in**, **plug into their
 tools**, and **learn from or extend**.
 
+## Execution status
+
+| Stream | Status | Notes |
+|---|---|---|
+| A — Robustness & sampling | ✅ done | repetition/presence/frequency + min-p; checked alloc + graceful errors; per-command `--help`; documented seeding |
+| C — OpenAI-compatible server | ✅ done | `ember serve`: `/v1/chat/completions` (+SSE), `/v1/models`, `/health`; hand-rolled HTTP + JSON |
+| B — More models | ✅ mostly | generalized converter; SmolLM2, Qwen2.5 (QKV bias), Qwen3 verified. **Deferred:** Llama-3 tiktoken + rope_scaling (gated checkpoint, no reference to diff against here) |
+| D — Quality/size | ◐ partial | **fp16 KV cache** done (`--kv-type f16`, ~lossless). **Deferred:** K-quants (Q4_K/Q6_K) + SIMD Q4 — need a reference logit-diff to land within the correctness constraint |
+| E — GGUF import | ⏳ deferred | depends on K-quants (D) and a GGUF-vs-HF logit-diff gate |
+| F — Platform reach | ⏳ deferred | AVX2 tuning + Windows shim; not verifiable on the ARM/macOS dev host |
+| G — Embeddability & DX | ✅ core done | `libember.a/.so`, ctypes Python bindings, ARCHITECTURE.md + CONTRIBUTING.md. **Deferred:** tagged release binaries / Homebrew |
+
+The deferrals share one cause: the repo's **"correctness proven against references"**
+constraint (below). K-quants, GGUF, and Llama-3 all need a reference logit-diff or a
+gated download that isn't available in this environment; shipping them unverified
+would violate the identity this plan is meant to protect. They are scoped and ready
+to pick up once that reference is set up.
+
 ### The identity constraint (do not violate)
 
 Every addition must preserve what makes this repo worth cloning:
