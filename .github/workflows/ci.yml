@@ -1,0 +1,45 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15          # Apple Silicon — the reference platform
+            reference: true
+          - os: ubuntu-24.04      # x86-64
+            reference: false
+          - os: ubuntu-24.04-arm  # ARM64 Linux
+            reference: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: stories15M-${{ hashFiles('tools/convert.py', 'tools/download.sh') }}
+
+      - name: Fetch + convert test model
+        run: ./tools/download.sh stories15M
+
+      - name: Build (optimized + debug)
+        run: |
+          make
+          make debug
+
+      - name: Smoke test — generate
+        run: ./ember generate models/stories15M.ember -p "Once upon a time" -n 32 -t 0
+
+      - name: Run tests
+        env:
+          # bit-exact transcript comparison only holds on the reference build
+          EMBER_SKIP_TRANSCRIPT: ${{ matrix.reference && '0' || '1' }}
+        run: ./tests/run_tests.sh

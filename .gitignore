@@ -1,0 +1,22 @@
+# build artifacts
+/ember
+/ember-baseline
+/ember-debug
+*.o
+*.dSYM/
+
+# upstream reference (test oracle only — not part of this project)
+/.reference/
+
+# model weights and converted files — never committed (fetched via tools/download.sh)
+/models/
+*.ember
+*.bin
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# os
+.DS_Store
