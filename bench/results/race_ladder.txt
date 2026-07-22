@@ -1,0 +1,21 @@
+# Naive-vs-optimized ladder — recorded run transcript
+# Measured 2026-07-19 (UTC), same session and quiet-machine protocol as the
+# llama.cpp comparison (see env.json). Apple M1 Pro, ember commit bd59278
+# working tree. Both numbers are single-thread decode at a SHORT context
+# (5-token prompt) — decode slows as context grows, which is why the
+# optimized figure here (253.9 tok/s) is higher than the tg128@d128
+# best-thread figure in results.json (228.9 tok/s at depth 128).
+# Regenerate live with: ./bench/race.sh   (or the commands below)
+
+$ make baseline
+cc -std=c11 -D_DEFAULT_SOURCE -Wall -Wextra -O0 -pthread -o ember-baseline src/*.c -lm
+
+$ ./ember-baseline generate models/stories110M.ember -p "Once upon a time" -n 48 -t 0
+[prefill 5 tok @ 11.2 tok/s | decode 48 tok @ 9.0 tok/s | 1 thread(s)]
+
+$ ./ember generate models/stories110M-q8.ember -p "Once upon a time" -n 128 -t 0 --threads 1
+[prefill 5 tok @ 367.0 tok/s | decode 128 tok @ 253.9 tok/s | 1 thread(s)]
+
+# naive (-O0, scalar, fp32): 9.0 tok/s decode
+# optimized (-O3, NEON, Q8_0): 253.9 tok/s decode
+# ratio: 28x
