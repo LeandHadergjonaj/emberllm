@@ -1,0 +1,30 @@
+{
+  "model_files": {
+    "models/qwen3-0.6b-q8.ember": 638233344,
+    "models/qwen2.5-0.5b-q8.ember": 529855936,
+    "models/smollm2-135m-q8.ember": 144424704,
+    "models/stories110M-q8.ember": 116875712,
+    "models/qwen3-0.6b-q4.ember": 418032384,
+    "models/gguf/qwen3-0.6b-q8_0.gguf": 804753184,
+    "models/gguf/qwen2.5-0.5b-q8_0.gguf": 531067808,
+    "models/gguf/smollm2-135m-q8_0.gguf": 144811008,
+    "models/gguf/stories110M-q8_0.gguf": 143274272,
+    "models/gguf/qwen3-0.6b-q4_0.gguf": 469080864
+  },
+  "binaries": {
+    "ember_binary_bytes": 122888,
+    "ember_links": "libSystem only (otool -L)",
+    "llama_cpu_binlibs_bytes": 4500776,
+    "llama_cpu_binlibs_note": "llama-bench + libllama + libggml{,-base,-cpu,-blas} dylibs, deduplicated",
+    "loc_emberllm_src": 3313,
+    "loc_emberllm_note": "wc -l src/*.c src/*.h",
+    "loc_llamacpp_core": 428228,
+    "loc_llamacpp_note": "wc -l over src/ ggml/src/ common/ (.c,.cpp,.h,.hpp) at b10068"
+  },
+  "build": {
+    "ember_make_seconds": 1.8,
+    "ember_make_note": "make clean && time make, quiet machine, M1 Pro (measured 2026-07-19)",
+    "llamacpp_build_seconds": 101,
+    "llamacpp_build_note": "cmake configure + build of only the 5 benchmark targets at -j8; measured while a pip install ran concurrently, so indicative only. A full llama.cpp build is larger."
+  }
+}
