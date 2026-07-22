@@ -1,0 +1,18 @@
+# Cross-engine greedy spot-check (2026-07-19T21:52Z)
+# llama.cpp b10068 CPU build; emberllm bd59278
+
+== stories110M-Q8_0, prompt: 'Once upon a time', greedy, 40 tokens ==
+--- emberllm: ./ember generate models/stories110M-q8.ember -p "Once upon a time" -n 40 -t 0 --threads 1
+Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red apple on a tree. She wanted to eat it
+
+--- llama.cpp: llama-completion -m models/gguf/stories110M-q8_0.gguf -p "Once upon a time" -n 40 --temp 0 -no-cnv
+ Once upon a time, there was a little girl named Lily. She loved to play outside in the sunshine. One day, she saw a big, red apple on a tree. She wanted to eat it
+
+
+== qwen3-0.6b-Q8_0, prompt: 'The capital of France is', greedy, 32 tokens ==
+--- emberllm:
+The capital of France is Paris, and the capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The capital of Japan is Tokyo. The
+
+--- llama.cpp:
+The capital of France is Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The capital of Japan is Tokyo. The capital
+
