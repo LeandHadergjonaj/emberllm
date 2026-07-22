@@ -96,23 +96,16 @@ ChatML chat models like Qwen3).
 
 ## Embed it (library + Python)
 
-The engine is also a library. `make lib` builds `libember.a` and `libember.so`
-from the same core the CLI uses (the `ember` binary is just `main.o` linked
-against the library), so the ~15-function C API in [`src/ember.h`](src/ember.h)
-is a complete embedding surface: load, tokenize, prefill/forward, sample.
-
-Python bindings ship in [`bindings/python`](bindings/python) — pure `ctypes`,
-no Python dependencies:
+`make lib` builds `libember.a` / `libember.so` from the same core the CLI uses
+— the `ember` binary is just `main.o` linked against the library, so the
+~20-function C API in [`src/ember.h`](src/ember.h) is a complete embedding
+surface: load, tokenize, prefill/forward, sample. Python bindings in
+[`bindings/python`](bindings/python) are pure `ctypes`:
 
 ```python
 from emberllm import Ember
 with Ember("models/stories110M-q8.ember") as m:
     print(m.generate_str("Once upon a time", max_tokens=64, temperature=0.8))
-```
-
-```sh
-make lib
-python3 bindings/python/example.py models/stories110M-q8.ember "Once upon a time"
 ```
 
 New to the code? [ARCHITECTURE.md](ARCHITECTURE.md) traces a token through the
