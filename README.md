@@ -216,15 +216,17 @@ src/tokenizer.c   SentencePiece-BPE and byte-level BPE, both from scratch
 src/quant.c       offline fp32 -> Q8_0/Q4_0
 src/sample.c      greedy / temperature / top-k / top-p / min-p + repeat penalties
 src/server.c      hand-rolled OpenAI-compatible HTTP/1.1 server (SSE streaming)
-src/json.c        tiny dependency-free JSON reader (for request bodies)
+src/json.c        tiny dependency-free JSON reader
 src/util.c        checked allocation + fatal-error helpers
 src/main.c        info | tokenize | generate | chat | serve | bench | perplexity | quantize
 tools/convert.py  llama2.c + LLaMA-style HF safetensors -> .ember (numpy, no torch)
+bench/            benchmark driver, results (raw JSON), demo tape
+notebooks/        the llama.cpp comparison notebook
 ```
 
 Several model families run through **one forward pass**, distinguished only by
-fields in the file header and the presence of optional tensors — the converter
-detects each variant from `config.json` rather than hard-coding it:
+header fields and optional tensors — the converter detects each variant from
+`config.json`:
 
 | Model | licence | `download.sh` name | arch notes | verified |
 |---|---|---|---|:-:|
@@ -233,11 +235,9 @@ detects each variant from `config.json` rather than hard-coding it:
 | Qwen2.5 0.5B / 1.5B | Apache-2.0 | `qwen2.5-0.5b` `qwen2.5-1.5b` | GQA, **QKV bias**, byte-BPE | ✅ |
 | SmolLM2 135M / 360M / 1.7B | Apache-2.0 | `smollm2-135m` … | LLaMA, GQA, tied embed, byte-BPE | ✅ |
 
-"Verified" = converts and generates coherent text on this engine; the
-TinyStories path is additionally checked token-for-token against `run.c`. Adding
-a new LLaMA-style model is usually just a `download.sh` line — the converter
-handles GQA, QK-norm, QKV bias, tied embeddings, and decoupled `head_dim`
-automatically.
+Adding a new LLaMA-style model is usually just a `download.sh` line — the
+converter handles GQA, QK-norm, QKV bias, tied embeddings, and decoupled
+`head_dim` automatically.
 
 ## Correctness
 
