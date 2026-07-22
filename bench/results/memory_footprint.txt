@@ -1,0 +1,18 @@
+# Memory footprint: peak RSS for 64-token generation, qwen3-0.6b Q8_0, 6 threads
+# NOTE: both engines mmap weights; resident weight pages count toward RSS on macOS once touched.
+--- emberllm:
+        1.15 real         1.97 user         0.48 sys
+           680935424  maximum resident set size
+--- llama.cpp (CPU):
+        2.89 real         5.44 user         1.37 sys
+          3281436672  maximum resident set size
+
+--- smollm2-135m, 2 threads:
+emberllm:
+           156516352  maximum resident set size
+llama.cpp:
+           514834432  maximum resident set size
+
+--- llama.cpp qwen3-0.6b with -c 512 (matched small context):
+          1508540416  maximum resident set size
+(emberllm 'ember generate' sizes its KV state to prompt+max_new; 'ember serve/chat' allocate the full context)
