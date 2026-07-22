@@ -51,7 +51,7 @@ A quiet winter's embrace.
 
 ```sh
 git clone https://github.com/LeandHadergjonaj/emberllm && cd emberllm
-make                              # builds ./ember (C11, uses NEON/AVX where present)
+make                              # ~2 s; uses NEON/AVX where present
 
 # a 110M TinyStories model — MIT-licensed, fun, and fast
 ./tools/download.sh stories110M   # fetches weights, converts, quantizes to Q8_0
@@ -63,9 +63,10 @@ make                              # builds ./ember (C11, uses NEON/AVX where pre
 ```
 
 No weights are committed; `download.sh` fetches them from Hugging Face and the
-converter turns them into a single self-describing `.ember` file.
-
-Every subcommand documents itself: `ember generate --help`, `ember chat --help`, etc.
+converter turns them into a single self-describing `.ember` file. Every
+subcommand documents itself: `ember generate --help`, `ember chat --help`, etc.
+A [VHS](https://github.com/charmbracelet/vhs) tape for the demo GIF lives at
+[`bench/demo.tape`](bench/demo.tape).
 
 ## Run it as a server
 
