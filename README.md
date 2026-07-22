@@ -242,14 +242,20 @@ converter handles GQA, QK-norm, QKV bias, tied embeddings, and decoupled
 ## Correctness
 
 From-scratch inference fails on *conventions*, not math — a wrong RoPE pairing
-or GQA index produces fluent-looking garbage. So the engine is checked against
-references, not just eyeballed:
+produces fluent-looking garbage. So the engine is checked against references,
+not just eyeballed:
 
-- The TinyStories forward pass matches karpathy's `run.c` **token-for-token** in
-  greedy mode (`tests/run_tests.sh`, run in CI on macOS-arm + Linux x86/arm).
+- The TinyStories forward pass matches karpathy's `run.c` **token-for-token**
+  in greedy mode (`tests/run_tests.sh`, run in CI on macOS-arm + Linux x86/arm).
+- Under greedy decoding, emberllm and llama.cpp emit **identical text** for a
+  40-token stories110M continuation, and near-identical text on Qwen3-0.6B
+  (each engine quantized the weights independently, so low-order bits differ)
+  — one prompt each, compared as text; transcripts in
+  [`bench/results/correctness_spotcheck.txt`](bench/results/correctness_spotcheck.txt).
 - The byte-level BPE tokenizer matches Hugging Face `tokenizers` on **512/512**
   fuzzed inputs (`tools/validate_bpe.py`).
-- `ember perplexity` gates quantization: Q8_0 stays within a hair of fp32.
+- `ember perplexity` gates quantization; a fixed `--seed` reproduces a run
+  bit-for-bit within one binary (see `make debug` for the deterministic build).
 
 ## Honest limitations
 
