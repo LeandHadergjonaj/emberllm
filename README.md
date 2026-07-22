@@ -70,9 +70,9 @@ A [VHS](https://github.com/charmbracelet/vhs) tape for the demo GIF lives at
 
 ## Run it as a server
 
-`ember serve` turns the engine into a drop-in local backend for anything that
-speaks the OpenAI API — chat UIs, editor plugins, agent frameworks — with no
-extra dependencies (the HTTP server and JSON reader are hand-rolled in
+`ember serve` is a drop-in local backend for anything that speaks the OpenAI
+API — chat UIs, editor plugins, agent frameworks — with no extra dependencies
+(the HTTP server and JSON reader are hand-rolled in
 [`src/server.c`](src/server.c) and [`src/json.c`](src/json.c)).
 
 ```sh
@@ -80,33 +80,19 @@ ember serve models/qwen3-0.6b-q8.ember --port 8080 --threads auto
 ```
 
 ```sh
-# non-streaming
 curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": "Write a haiku about winter."}]
-}'
-
-# token streaming (Server-Sent Events)
-curl -N http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
-  "messages": [{"role": "user", "content": "Count to five."}],
+  "messages": [{"role": "user", "content": "Write a haiku about winter."}],
   "stream": true
 }'
 ```
 
-It exposes **`POST /v1/chat/completions`** (with SSE streaming when
-`"stream": true`), **`GET /v1/models`**, and **`GET /health`**. Requests honour
-`temperature`, `top_p`, `top_k`, `max_tokens`, `stop` (string or array),
-`repeat_penalty`, and `presence/frequency_penalty`. It also works from the OpenAI
-Python client by pointing `base_url` at it:
-
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
-r = client.chat.completions.create(model="ember", messages=[{"role":"user","content":"hi"}])
-```
-
-Scope is deliberately **single-stream**: one request is served at a time, using
-the same KV cache and forward pass as the CLI. The prompt is assembled with the
-ChatML template, so `serve` targets ChatML chat models (e.g. Qwen3).
+It exposes **`POST /v1/chat/completions`** (with SSE streaming), **`GET
+/v1/models`**, and **`GET /health`**; requests honour `temperature`, `top_p`,
+`top_k`, `max_tokens`, `stop`, `repeat_penalty`, and
+`presence/frequency_penalty`. The OpenAI Python client works by pointing
+`base_url` at it. Scope is deliberately **single-stream** — one request at a
+time, same forward pass as the CLI, ChatML prompt template (so it targets
+ChatML chat models like Qwen3).
 
 ## Embed it (library + Python)
 
