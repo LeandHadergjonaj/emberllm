@@ -1,10 +1,42 @@
 # emberllm
 
-A CPU-only LLM inference engine, written from scratch in ~3,200 lines of C11.
-No GPU, no runtime dependencies, one `Makefile`. It runs a 110M-parameter model
-at **~260 tokens/second**, holds a real chat with **Qwen3-0.6B at ~60 tok/s** on
-a plain laptop CPU, and serves an **OpenAI-compatible API** so it drops in behind
-tools that already speak it.
+A CPU-only LLM inference engine written from scratch in **~3,300 lines of
+dependency-free C11**. One `Makefile`, a ~2-second build, a **123 KB binary**
+(it links nothing but libSystem) that holds a real chat with Qwen3-0.6B,
+serves an **OpenAI-compatible API**, and embeds as a C library or from Python
+via ctypes.
+
+And because "fast for a from-scratch engine" is meaningless without a
+reference: emberllm is **benchmarked head-to-head against
+[llama.cpp](https://github.com/ggml-org/llama.cpp)** — same machine, same
+upstream weights, same measurements. The honest result: llama.cpp's CPU
+backend is **1.8–2.5× faster at decoding** and **5–7× faster at prompt
+processing**. What emberllm offers is the other side of that trade: **about
+half of llama.cpp's single-stream decode speed from 1/130th as much code** —
+an engine you can read in an afternoon, understand completely, and embed
+anywhere a C compiler goes.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/decode-dark.png">
+  <img alt="Single-stream decode benchmark: emberllm vs llama.cpp CPU on four models"
+       src="docs/assets/decode-light.png">
+</picture>
+
+| model (Q8_0) | emberllm | llama.cpp (CPU) | llama.cpp (Metal GPU) |
+|---|---:|---:|---:|
+| stories110M | 229 tok/s | **559 tok/s** | 436 tok/s |
+| SmolLM2-135M | 179 tok/s | **373 tok/s** | 245 tok/s |
+| Qwen2.5-0.5B | 95 tok/s | **168 tok/s** | 143 tok/s |
+| Qwen3-0.6B | 65 tok/s | 125 tok/s | **130 tok/s** |
+
+*Single-stream decode, 128 tokens at a 128-token context depth, mean of 5
+runs; the CPU engines at their best thread count from a 1–8 sweep, Metal
+measured at one standard configuration. Apple M1 Pro, macOS, llama.cpp release
+`b10068`. Note the Metal column: on three of these four small models,
+llama.cpp's own **CPU** decode beats its GPU. Full methodology, thread-scaling
+curves, prefill numbers, raw JSON, and every configuration where emberllm
+loses:
+**[notebooks/benchmark_vs_llamacpp.ipynb](notebooks/benchmark_vs_llamacpp.ipynb)**.*
 
 ```
 $ ./ember chat models/qwen3-0.6b-q8.ember --threads auto
@@ -14,17 +46,6 @@ A frost-kissed sky
 Whispers of snow on the wind,
 A quiet winter's embrace.
 ```
-
-```
-$ ./ember generate models/stories110M-q8.ember -p "Once upon a time"
-Once upon a time, there was a little boy named Timmy. Timmy loved to play
-outside in the sunshine. One day, Timmy was walking in the forest when he saw
-a giant. The giant was very tall and had a big smile on his face...
-[prefill 5 tok @ 292 tok/s | decode 128 tok @ 259 tok/s | 1 thread]
-```
-
-A [VHS](https://github.com/charmbracelet/vhs) tape for the demo GIF lives at
-[`bench/demo.tape`](bench/demo.tape) — regenerate with `vhs bench/demo.tape`.
 
 ## Quickstart
 
