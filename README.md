@@ -280,10 +280,12 @@ not just eyeballed:
 ## Credits
 
 Built independently, but it stands on ideas from
-[llama2.c](https://github.com/karpathy/llama2.c) (the tiny-model demo, the export
-script, and the correctness oracle), [llama.cpp](https://github.com/ggml-org/llama.cpp)
-(block quantization, mmap, benchmark methodology), and
-[calm](https://github.com/zeux/calm) (a self-describing single-file format). The
-techniques are reimplemented from scratch; no code was copied.
+[llama2.c](https://github.com/karpathy/llama2.c) (the tiny-model demo, the
+export script, and the correctness oracle),
+[llama.cpp](https://github.com/ggml-org/llama.cpp) (block quantization, mmap,
+and the `llama-bench` methodology this comparison mirrors), and
+[calm](https://github.com/zeux/calm) (a self-describing single-file format).
+The techniques are reimplemented from scratch; no code was copied.
 
-MIT licensed. The models it runs are MIT (TinyStories) and Apache-2.0 (Qwen3).
+MIT licensed. The models it runs are MIT (TinyStories) and Apache-2.0
+(Qwen, SmolLM2).
