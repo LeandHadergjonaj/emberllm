@@ -111,52 +111,60 @@ with Ember("models/stories110M-q8.ember") as m:
 New to the code? [ARCHITECTURE.md](ARCHITECTURE.md) traces a token through the
 engine; [CONTRIBUTING.md](CONTRIBUTING.md) has an "add your own model" guide.
 
-## Sampling and reproducibility
+## The benchmark, honestly
 
-`generate` and `chat` expose the standard sampling controls:
+The full comparison lives in
+[notebooks/benchmark_vs_llamacpp.ipynb](notebooks/benchmark_vs_llamacpp.ipynb),
+with raw data in [`bench/results/`](bench/results) and the driver in
+[`bench/compare_llamacpp.py`](bench/compare_llamacpp.py). The design, in one
+paragraph: both engines run the **same upstream weights** (Qwen3-0.6B,
+Qwen2.5-0.5B-Instruct, SmolLM2-135M-Instruct, stories110M), each converted and
+quantized to **Q8_0 by that engine's own tooling**; llama.cpp is a **stock
+release build** at pinned tag `b10068` (CPU build with Accelerate, plus a Metal
+build for context); both are measured the same way (batch prefill tok/s, and
+decode tok/s at a pinned context depth; 1 warmup + 5 timed reps, mean ± sd,
+serially, on a quiet machine — on battery, which Apple Silicon doesn't
+throttle for) — 220 matrix measurements across 5 thread counts, 2 context
+depths, and 2 quantizations, plus a 2-row end-of-run drift check that came
+back ~3% slower (small, and it bounds any thermal/battery drift). Spot-check:
+under greedy decoding both engines emit **identical text** for a 40-token
+stories110M continuation (transcript in `bench/results/`), and near-identical
+text on Qwen3-0.6B.
 
-```sh
-ember generate model.ember -p "..." \
-  -t 0.8 --top-k 40 --top-p 0.95 --min-p 0.05 \
-  --repeat-penalty 1.2 --repeat-last-n 256 \
-  --presence-penalty 0.1 --frequency-penalty 0.1 --seed 42
-```
+Where emberllm **loses**, plainly:
 
-- **`--repeat-penalty`** (`>1` discourages), **`--presence-penalty`**, and
-  **`--frequency-penalty`** act over the last **`--repeat-last-n`** tokens — the
-  single biggest quality win for small chat models, which otherwise loop. `chat`
-  turns on a mild `--repeat-penalty 1.1` by default; `generate` leaves it off.
-- **`--min-p`** keeps only tokens with probability ≥ `min_p × peak`.
-- All penalty controls default to no-ops, so a plain temperature/top-k/top-p run
-  is unchanged.
+- **Every head-to-head throughput configuration.** Best case is single-threaded
+  decode of small Q8_0 models (61–66% of llama.cpp); worst is multi-threaded
+  prefill (llama.cpp's tuned GEMMs + Accelerate are 5–7× faster at pp512).
+- **Q4_0 decode is ~4× slower** (44 vs 175 tok/s on Qwen3-0.6B): emberllm's
+  Q4_0 kernel is scalar and unoptimized, while llama.cpp runtime-repacks Q4_0
+  for NEON. Use Q8_0 with emberllm.
+- **The GPU exists, and it owns prefill.** llama.cpp with Metal prefills
+  3,200–15,700 tok/s — ~3× its own CPU backend, 16–22× emberllm. (Decode is
+  a different story: at these model sizes Metal only beats llama.cpp's CPU
+  decode on Qwen3-0.6B, and loses to it on the three smaller models — GPU
+  dispatch overhead dominates tiny kernels. It still beats emberllm's decode
+  everywhere.)
+- **Breadth.** llama.cpp runs nearly every open model family at every size,
+  with K-quants, grammars, parallel serving, and a huge ecosystem. emberllm
+  runs LLaMA-family models up to ~2B parameters.
 
-**Reproducibility:** a fixed `--seed` reproduces a run **bit-for-bit within one
-binary**. It is *not* portable across builds or machines — the forward pass sums
-floats in parallel and with `-ffast-math`, so reduction order (and thus the last
-ULP of each logit) depends on thread count, SIMD width, and compiler flags. For a
-byte-stable oracle use the `make debug` build single-threaded (`--threads 1`),
-which is what the golden-transcript test relies on.
+Where emberllm stands, plainly:
 
-## Measured performance
+- **Decode holds 41–57% of llama.cpp's best-thread speed** (40–55% at the
+  deeper 512-token context) — 65–95 tok/s on real 0.5–0.6B chat models,
+  179–229 tok/s on 110–135M models — far above reading speed, from a codebase
+  ~130× smaller (3,313 lines vs ~428k core lines at `b10068`).
+- **Memory stays proportional to what you asked for**: peak RSS for a 64-token
+  Qwen3-0.6B generation was **681 MB vs 3.3 GB** for llama.cpp at defaults
+  (1.5 GB with `-c 512`) — one indicative config, methodology caveats in the
+  notebook.
+- **Zero dependencies, ~2 s build, 123 KB binary** vs a cmake build producing
+  ~4.5 MB of binaries+libraries. Both are small; only one fits in your head.
 
-Apple M1 Pro (6 performance cores), single stream. `pp` = prompt processing
-(prefill), `tg` = token generation (decode). Numbers are `ember bench` means
-over 5 runs; **measure your own hardware before quoting these.**
-
-| Model | build | threads | decode | prefill |
-|---|---|---:|---:|---:|
-| stories110M | naive (`-O0`, scalar, fp32) | 1 | 8.8 tok/s | — |
-| stories110M | optimized (Q8_0 + NEON) | 1 | **259 tok/s** | 292 tok/s |
-| Qwen3-0.6B | Q8_0 + NEON | 1 | 50 tok/s | — |
-| Qwen3-0.6B | Q8_0 + NEON | 6 | **64 tok/s** | 176 tok/s |
-
-Those first two rows are the same 110M weights: **~29× from the naive build to
-the optimized one**, purely from engineering. Run it yourself:
-
-```sh
-./bench/race.sh          # naive vs optimized, side by side
-./ember bench models/qwen3-0.6b-q8.ember --pp 128 --tg 128 --threads 6
-```
+To reproduce: the notebook's §11 lists the exact commands (build the pinned
+llama.cpp, convert the same weights with its own tooling, run
+`bench/compare_llamacpp.py` on a quiet machine, re-execute the notebook).
 
 ## How it works
 
