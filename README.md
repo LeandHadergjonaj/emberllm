@@ -259,23 +259,23 @@ not just eyeballed:
 
 ## Honest limitations
 
-- **Tuned for Apple Silicon / NEON.** x86 has a correct AVX2 path but hasn't been
-  performance-tuned; other targets fall back to a correct scalar build. Widening
-  and tuning the AVX2 path is the first thing on the list.
-- **`Q4_0` is smaller but not faster** here — its kernel isn't SIMD-optimized yet,
-  so `Q8_0` is the sweet spot (fast *and* near-lossless).
-- **fp16 KV cache is available** (`--kv-type f16`) and halves KV memory at a
-  negligible quality cost (perplexity moved ~0.01% in testing); fp32 stays the
-  default. **K-quants (Q4_K/Q6_K) are not yet implemented** — Q8_0 is the sweet
-  spot, and adding K-quants is the main remaining quality/size lever (and the
-  prerequisite for GGUF import).
-- **The pre-tokenizer regex is approximated** (C has no `\p{L}`). It's fuzz-clean
-  on realistic English/code/Unicode but may differ from HF on pathological input.
-- Scope is single-stream inference of LLaMA-family models up to ~2B parameters.
-  No training, batching across requests, speculative decoding, or GGUF import.
-- Malformed models and bad inputs fail with a clear `ember: ...` message rather
-  than a crash, but the loader trusts a well-formed header's internal offsets
-  once the top-level bounds check passes.
+- **Slower than llama.cpp on every measured configuration** — see
+  [the benchmark](#the-benchmark-honestly) for exactly how much. If you want
+  maximum speed or model breadth, use llama.cpp; this project's value is a
+  complete, readable, embeddable engine.
+- **Tuned for Apple Silicon / NEON.** The AVX2 path is correct but untuned;
+  other targets fall back to scalar. The measured comparison is one machine
+  (M1 Pro) — relative results elsewhere will differ.
+- **`Q4_0` is smaller but much slower** (scalar kernel; measured 4× behind
+  llama.cpp). Q8_0 is the sweet spot. **K-quants are not implemented** — the
+  main remaining size/quality lever, and the prerequisite for GGUF import.
+- **fp16 KV cache** (`--kv-type f16`) halves KV memory; fp32 stays the default.
+- **The pre-tokenizer regex is approximated** (C has no `\p{L}`); fuzz-clean on
+  realistic input, may differ from HF on pathological Unicode.
+- Scope is single-stream inference of LLaMA-family models up to ~2B params. No
+  training, no batched serving, no speculative decoding, no GGUF import.
+- Malformed models fail with a clean `ember: ...` error, but the loader trusts
+  a well-formed header's internal offsets after the top-level bounds check.
 
 ## Credits
 
