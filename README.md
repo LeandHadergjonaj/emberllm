@@ -166,34 +166,42 @@ To reproduce: the notebook's §11 lists the exact commands (build the pinned
 llama.cpp, convert the same weights with its own tooling, run
 `bench/compare_llamacpp.py` on a quiet machine, re-execute the notebook).
 
-## How it works
+## Why it's as fast as it is
 
-Single-stream decode on a CPU is **memory-bandwidth-bound**: to generate one
-token the engine streams essentially the whole weight file through the cores, so
+Single-stream decode on a CPU is **memory-bandwidth-bound**: generating one
+token streams essentially the whole weight file through the cores, so
 
 > tokens/second ≈ memory bandwidth ÷ bytes per token
 
 Everything in emberllm follows from that one fact:
 
-- **Quantization is the biggest lever.** `Q8_0` (8-bit, 32-weight blocks with an
-  fp16 scale) cuts bytes-per-token ~4× versus fp32 and is near-lossless — its
-  perplexity is within 0.3% of fp32 on this model. `Q4_0` halves it again for
-  some quality cost. Quantization is done offline by `ember quantize`.
-- **Threads help until bandwidth saturates — so let the engine pick.** A hand-rolled
-  pool splits each matmul (and attention over heads) across cores, but the useful
-  thread count depends on the model: big models (Qwen3) scale to ~6 threads, while a
-  small quantized model is bandwidth-bound and fastest at 1. Rather than guess, pass
-  **`--threads auto`** and the engine measures a few token times and picks the best
-  count for *your* model and machine. See [report.md](report.md) for the analysis.
-- **SIMD keeps a core from going compute-bound.** NEON (`sdot`) on Apple Silicon,
-  AVX2 on x86, with a scalar fallback. The single biggest kernel win was doing
-  fp16→fp32 scale conversion in one hardware instruction instead of by hand.
-- **Batched-GEMM prefill** streams each weight row once for the whole prompt
-  (2.6× faster time-to-first-token than one-token-at-a-time).
-- **mmap** loads weights with zero copies for instant startup.
+- **Quantization is the biggest lever.** `Q8_0` (8-bit, 32-weight blocks with
+  an fp16 scale — the same block format llama.cpp uses) cuts bytes-per-token
+  ~4× versus fp32 and is near-lossless. Done offline by `ember quantize`.
+- **Threads help until bandwidth saturates — so let the engine pick.** A
+  hand-rolled pool splits matmuls and attention across cores, but the useful
+  count depends on the model: in the benchmark, decode peaks anywhere from
+  **1 thread** (SmolLM2 on emberllm) to 6, and nearly every curve — on both
+  engines — falls at 8 threads, where E-cores stall the barrier.
+  **`--threads auto`** measures a few token times and picks for your machine.
+  See [report.md](report.md) for the full thread-scaling investigation.
+- **SIMD keeps a core from going compute-bound**: NEON (`sdot`) on Apple
+  Silicon, AVX2 on x86, scalar fallback elsewhere.
+- **Batched-GEMM prefill** streams each weight row once for the whole prompt;
+  **mmap** loads weights with zero copies.
 
-The optimization ladder, on the same 110M model: naive fp32 (~9 tok/s) →
-`-O3` + NEON → multithreading → **Q8_0 quantization** (~260 tok/s).
+The same 110M model, on the same machine and protocol as the comparison
+(transcript: [`bench/results/race_ladder.txt`](bench/results/race_ladder.txt)):
+the naive build (`-O0`, scalar, fp32) decodes at **9.0 tok/s**; the optimized
+build (Q8_0 + NEON) at **253.9 tok/s** on one thread — **28× from engineering
+alone**. (Both at a 5-token prompt; decode slows as context grows, which is
+why the headline table's depth-128 figure is lower.) Run it yourself:
+`./bench/race.sh`.
+
+The gap that remains against llama.cpp is also engineering: tuned/repacked
+GEMM kernels, Accelerate BLAS on the prompt path, threaded decode that scales
+past 2 threads. The notebook's §9 shows both engines sit in the same
+memory-bandwidth regime — llama.cpp just streams bytes more efficiently.
 
 ## What's in the box
 
